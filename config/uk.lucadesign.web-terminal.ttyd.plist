@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>uk.lucadesign.web-terminal.ttyd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/thomas990p/web-terminal/bin/run-ttyd.sh</string>
+  </array>
+  <key>UserName</key>
+  <string>thomas990p</string>
+  <key>GroupName</key>
+  <string>staff</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/thomas990p</string>
+    <key>USER</key>
+    <string>thomas990p</string>
+    <key>LOGNAME</key>
+    <string>thomas990p</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/thomas990p/web-terminal</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/thomas990p/web-terminal/logs/ttyd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/thomas990p/web-terminal/logs/ttyd.log</string>
+</dict>
+</plist>

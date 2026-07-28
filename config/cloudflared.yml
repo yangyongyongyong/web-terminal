@@ -1,0 +1,27 @@
+# Cloudflare Tunnel → 管理页(7690) + ttyd(/term → 7681)
+# tunnel: web-terminal
+tunnel: 7969fb73-7802-4be4-8205-899320051f34
+credentials-file: /Users/thomas990p/.cloudflared/7969fb73-7802-4be4-8205-899320051f34.json
+
+# 源站连接更耐抖（WebSocket / 长连接）
+originRequest:
+  connectTimeout: 30s
+  tcpKeepAlive: 30s
+  keepAliveTimeout: 90s
+  keepAliveConnections: 100
+  noHappyEyeballs: true
+  disableChunkedEncoding: false
+
+ingress:
+  # 终端（WebSocket）：必须带 /term 前缀
+  - hostname: term.lucadesign.uk
+    path: ^/term/?.*
+    service: http://127.0.0.1:7681
+    originRequest:
+      http2Origin: false
+  # 会话管理首页与 API
+  - hostname: term.lucadesign.uk
+    service: http://127.0.0.1:7690
+    originRequest:
+      http2Origin: false
+  - service: http_status:404

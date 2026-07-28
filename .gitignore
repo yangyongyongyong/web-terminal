@@ -1,0 +1,13 @@
+# 密钥与本地配置（勿提交）
+.env
+.env.*
+!.env.example
+
+logs/
+run/
+web/ttyd-stock.html
+web/ttyd-index.html
+__pycache__/
+*.pyc
+*.log
+.DS_Store
