@@ -220,6 +220,7 @@ let pending = null;
 let nameModalMode = null; // { type: 'create' } | { type: 'rename', oldName }
 let cache = { sessions: [], history: [], path_root: '', default_path: '' };
 const rowSelected = new Set(); // name + \\u001e + cwd + \\u001e + live|dead
+let lastRowChkIndex = null; // 多选：普通点击锚点，供 Shift 范围选取
 let sortKey = 'status';
 let sortDir = 1; // 1 asc, -1 desc
 
@@ -484,11 +485,29 @@ function renderList() {
     if (allBox) allBox.checked = boxes.length > 0 && boxes.every(b => b.checked);
   };
   wrap.querySelectorAll('.row-chk').forEach(box => {
-    box.onchange = () => {
-      const key = box.getAttribute('data-key');
-      if (box.checked) rowSelected.add(key); else rowSelected.delete(key);
+    // Shift+点击时避免连带选中表格文字
+    box.addEventListener('mousedown', (e) => {
+      if (e.shiftKey) e.preventDefault();
+    });
+    box.addEventListener('click', (e) => {
+      const boxes = [...wrap.querySelectorAll('.row-chk')];
+      const idx = boxes.indexOf(box);
+      if (e.shiftKey && lastRowChkIndex !== null && lastRowChkIndex !== idx) {
+        const start = Math.min(lastRowChkIndex, idx);
+        const end = Math.max(lastRowChkIndex, idx);
+        const check = box.checked;
+        for (let j = start; j <= end; j++) {
+          boxes[j].checked = check;
+          const key = boxes[j].getAttribute('data-key');
+          if (check) rowSelected.add(key); else rowSelected.delete(key);
+        }
+      } else {
+        const key = box.getAttribute('data-key');
+        if (box.checked) rowSelected.add(key); else rowSelected.delete(key);
+      }
+      lastRowChkIndex = idx;
       syncAll();
-    };
+    });
   });
   const allBox = document.getElementById('rowCheckAll');
   if (allBox) {
@@ -498,6 +517,7 @@ function renderList() {
         const key = box.getAttribute('data-key');
         if (allBox.checked) rowSelected.add(key); else rowSelected.delete(key);
       });
+      lastRowChkIndex = null;
     };
   }
 
@@ -628,18 +648,18 @@ document.getElementById('nameModal').addEventListener('click', (ev) => {
 document.getElementById('btnBulkDel').onclick = async () => {
   const rows = selectedRows();
   if (!rows.length) { flash('请先勾选会话', true); return; }
-  if (!confirm('删除/停止选中的 ' + rows.length + ' 个会话？绿点会停止进程，红点仅删记录。')) return;
+  if (!confirm('彻底删除选中的 ' + rows.length + ' 个会话？绿点会结束进程且不留记录，红点仅删记录。')) return;
   try {
     for (const r of rows) {
       if (r.live) {
-        await api('/api/sessions/' + encodeURIComponent(r.name), { method: 'DELETE' });
+        await api('/api/sessions/' + encodeURIComponent(r.name) + '?purge=1', { method: 'DELETE' });
       } else {
         const qs = new URLSearchParams({ name: r.name, cwd: r.cwd || '' });
         await api('/api/history?' + qs.toString(), { method: 'DELETE' });
       }
       rowSelected.delete(rowKey(r));
     }
-    flash('已处理 ' + rows.length + ' 项');
+    flash('已删除 ' + rows.length + ' 项');
     await refresh();
   } catch (e) { flash(String(e.message || e), true); }
 };
@@ -953,7 +973,12 @@ class Handler(BaseHTTPRequestHandler):
             if not name:
                 self._json(400, {"error": "name required"})
                 return
-            cp = run_ctl("kill", name)
+            qs = parse_qs(parsed.query)
+            purge = (qs.get("purge") or [""])[0] in ("1", "true", "yes")
+            args = ["kill", name]
+            if purge:
+                args.append("--purge")
+            cp = run_ctl(*args)
             if cp.returncode != 0:
                 self._json(500, {"error": cp.stderr.strip() or "kill failed"})
                 return

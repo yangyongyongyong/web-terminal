@@ -112,8 +112,11 @@ cmd_create() {
 }
 
 cmd_kill() {
-  local name sid created last_open cwd
+  local name sid created last_open cwd purge=0
   name="$(sanitize "${1:-}")"
+  if [[ "${2:-}" == "--purge" || "${2:-}" == "purge" ]]; then
+    purge=1
+  fi
   if [[ -z "${name}" ]]; then
     echo "需要会话名" >&2
     exit 1
@@ -122,6 +125,34 @@ cmd_kill() {
   if ! "${TMUX_BIN}" has-session -t "${sid}" 2>/dev/null; then
     echo "会话不存在或已停止: ${name}" >&2
     exit 1
+  fi
+  if [[ "${purge}" -eq 1 ]]; then
+    # 彻底删除：停进程且不留历史记录
+    "${TMUX_BIN}" kill-session -t "${sid}"
+    rm -f "${META_DIR}/${sid}".*
+    /opt/homebrew/bin/python3 - "${name}" "${HISTORY_FILE}" <<'PY'
+import json, sys
+from pathlib import Path
+name, path = sys.argv[1:3]
+p = Path(path)
+if not p.exists():
+    raise SystemExit(0)
+items = []
+for line in p.read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if obj.get("name") == name:
+        continue
+    items.append(obj)
+p.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in items), encoding="utf-8")
+PY
+    echo "purged:${name}"
+    return 0
   fi
   created="$(meta_get "${sid}" created)"
   last_open="$(meta_get "${sid}" last_open)"
@@ -317,14 +348,14 @@ PY
 }
 
 usage() {
-  echo "用法: $0 list|create <name> [cwd]|kill <name>|rename <old> <new>|history|history-del <name> [cwd]|resolve [cwd]" >&2
+  echo "用法: $0 list|create <name> [cwd]|kill <name> [--purge]|rename <old> <new>|history|history-del <name> [cwd]|resolve [cwd]" >&2
   exit 1
 }
 
 case "${1:-}" in
   list) cmd_list ;;
   create) cmd_create "${2:-}" "${3:-}" ;;
-  kill) cmd_kill "${2:-}" ;;
+  kill) cmd_kill "${2:-}" "${3:-}" ;;
   rename) cmd_rename "${2:-}" "${3:-}" ;;
   history) cmd_history ;;
   history-del) cmd_history_del "${2:-}" "${3:-}" ;;
