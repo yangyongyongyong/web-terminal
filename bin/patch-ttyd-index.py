@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 STOCK = ROOT / "web" / "ttyd-stock.html"
 OUT = ROOT / "web" / "ttyd-index.html"
 WHEEL_JS = ROOT / "web" / "wt-wheel.js"
+PASTE_JS = ROOT / "web" / "wt-paste-image.js"
 
 
 def public_host() -> str:
@@ -25,6 +26,13 @@ def wheel_js_for_inject() -> str:
     raw = WHEEL_JS.read_text(encoding="utf-8")
     if "decideWheelAction" not in raw or "swallow" not in raw:
         raise SystemExit(f"{WHEEL_JS} 缺少滚轮防方向键策略")
+    return raw
+
+
+def paste_js_for_inject() -> str:
+    raw = PASTE_JS.read_text(encoding="utf-8")
+    if "hookPasteImage" not in raw or "paste-image" not in raw:
+        raise SystemExit(f"{PASTE_JS} 缺少图片粘贴逻辑")
     return raw
 
 
@@ -53,11 +61,14 @@ INJECT_HEAD = r"""
   <a href="https://__PUBLIC_HOST__/" target="_blank" rel="noopener">会话管理</a>
   <span id="wt-session"></span>
   <span id="wt-status">连接中…</span>
-  <span id="wt-hint" style="color:#8b9aab">滚轮回看约30页</span>
+  <span id="wt-hint" style="color:#8b9aab">滚轮回看约30页 · Ctrl+V 可贴图</span>
 </div>
 <script id="wt-wheel">
 window.WT_SCROLLBACK_PAGES = __SCROLLBACK_PAGES__;
 __WHEEL_JS__
+</script>
+<script id="wt-paste-image">
+__PASTE_JS__
 </script>
 <script id="wt-reconnect">
 (function () {
@@ -156,6 +167,10 @@ __WHEEL_JS__
     var ok = window.WtWheel && window.WtWheel.hookLocalWheel(function () { return window.term; });
     if (ok || hookTries > 80) clearInterval(hookTimer);
   }, 250);
+
+  if (window.WtPasteImage && window.WtPasteImage.hookPasteImage) {
+    window.WtPasteImage.hookPasteImage(function () { return window.term; });
+  }
 })();
 </script>
 """
@@ -171,7 +186,8 @@ def build_inject() -> str:
                 break
     inject = INJECT_HEAD.replace("__PUBLIC_HOST__", public_host())
     inject = inject.replace("__SCROLLBACK_PAGES__", pages)
-    return inject.replace("__WHEEL_JS__", wheel_js_for_inject())
+    inject = inject.replace("__WHEEL_JS__", wheel_js_for_inject())
+    return inject.replace("__PASTE_JS__", paste_js_for_inject())
 
 
 def main() -> int:
@@ -180,6 +196,9 @@ def main() -> int:
         return 1
     if not WHEEL_JS.exists():
         print(f"缺少 {WHEEL_JS}", file=sys.stderr)
+        return 1
+    if not PASTE_JS.exists():
+        print(f"缺少 {PASTE_JS}", file=sys.stderr)
         return 1
     html = STOCK.read_text(encoding="utf-8")
     if 'id="wt-reconnect"' in html:

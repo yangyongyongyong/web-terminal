@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -46,6 +48,15 @@ PATH_ROOT = str(Path(ENV.get("SESSION_PATH_ROOT") or HOME).expanduser())
 DEFAULT_PATH = str(Path(ENV.get("SESSION_DEFAULT_PATH") or HOME).expanduser())
 SESSION_CTL = str(ROOT / "bin" / "session-ctl.sh")
 NAME_RE = re.compile(r"^[\w\-]{1,64}$")  # 含中文等 Unicode 字母数字；不含 . : / 空白
+PASTE_DIR = ROOT / "run" / "paste-images"
+PASTE_MAX_BYTES = 12 * 1024 * 1024
+PASTE_MIME_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
 
 MANAGE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -785,6 +796,119 @@ def parse_cookies(header: str) -> dict[str, str]:
     return out
 
 
+def cleanup_paste_images(max_age_sec: int = 86400, keep_newest: int = 40) -> None:
+    PASTE_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted(PASTE_DIR.glob("wt-paste-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    now = time.time()
+    for i, p in enumerate(files):
+        try:
+            age = now - p.stat().st_mtime
+            if i >= keep_newest or age > max_age_sec:
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def png_dimensions(path: Path) -> tuple[int, int]:
+    cp = subprocess.run(
+        ["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    if cp.returncode != 0:
+        return 0, 0
+    w = h = 0
+    for line in (cp.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("pixelWidth:"):
+            try:
+                w = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("pixelHeight:"):
+            try:
+                h = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+    return w, h
+
+
+def convert_to_png(src: Path) -> Path:
+    """macOS sips 转 PNG；已是 png 则原样返回。"""
+    if src.suffix.lower() == ".png":
+        return src
+    out = src.with_suffix(".png")
+    cp = subprocess.run(
+        ["sips", "-s", "format", "png", str(src), "--out", str(out)],
+        capture_output=True,
+        text=True,
+    )
+    if cp.returncode != 0 or not out.is_file():
+        raise RuntimeError((cp.stderr or cp.stdout or "sips 转换失败").strip())
+    return out
+
+
+def set_macos_clipboard_png(path: Path) -> bool:
+    """把 PNG 写入 macOS 剪贴板，供同机 Claude Code Ctrl+V 读取。"""
+    posix = str(path.resolve())
+    # 用 NSData 写入，避免部分环境下 read…as PNGf 丢内容
+    script = f'''
+set pngPath to "{posix}"
+set pngData to (read (POSIX file pngPath) as «class PNGf»)
+set the clipboard to pngData
+'''
+    cp = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if cp.returncode == 0:
+        return True
+    # 兜底
+    script2 = f'set the clipboard to (read (POSIX file "{posix}") as «class PNGf»)'
+    cp2 = subprocess.run(["osascript", "-e", script2], capture_output=True, text=True)
+    return cp2.returncode == 0
+
+
+def save_paste_image(
+    raw: bytes,
+    mime: str,
+    *,
+    set_clipboard: bool = True,
+    min_pixels: int = 64,
+) -> tuple[Path, bool, int, int]:
+    """保存图片；可选写入系统剪贴板。返回 (path, clipboard_ok, width, height)。"""
+    if len(raw) > PASTE_MAX_BYTES:
+        raise ValueError(f"图片过大（上限 {PASTE_MAX_BYTES // (1024 * 1024)}MB）")
+    if not raw:
+        raise ValueError("空图片")
+    mime_l = (mime or "image/png").split(";", 1)[0].strip().lower()
+    if not mime_l.startswith("image/"):
+        raise ValueError("仅支持图片")
+    ext = PASTE_MIME_EXT.get(mime_l, ".bin")
+    if ext == ".bin":
+        if raw.startswith(b"\x89PNG"):
+            ext = ".png"
+        elif raw.startswith(b"\xff\xd8"):
+            ext = ".jpg"
+        elif raw.startswith(b"RIFF") and b"WEBP" in raw[:16]:
+            ext = ".webp"
+        elif raw.startswith(b"GIF8"):
+            ext = ".gif"
+        else:
+            raise ValueError(f"不支持的图片类型: {mime_l}")
+    cleanup_paste_images()
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    PASTE_DIR.mkdir(parents=True, exist_ok=True)
+    src = PASTE_DIR / f"wt-paste-{stamp}-{digest}{ext}"
+    src.write_bytes(raw)
+    png = convert_to_png(src)
+    width, height = png_dimensions(png)
+    pixels = width * height
+    clip_ok = False
+    # 过小图（常见于错误取到预览）禁止写剪贴板，避免覆盖用户原图
+    if set_clipboard and pixels >= min_pixels:
+        clip_ok = set_macos_clipboard_png(png)
+    return png, clip_ok, width, height
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "WebTerminalManage/1.0"
 
@@ -798,24 +922,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Unauthorized")
 
-    def _check_auth(self) -> bool:
+    def _basic_ok(self) -> bool:
         hdr = self.headers.get("Authorization", "")
         if not hdr.startswith("Basic "):
-            self._unauthorized()
             return False
         try:
             raw = base64.b64decode(hdr[6:].encode("ascii")).decode("utf-8")
         except Exception:
-            self._unauthorized()
             return False
         if ":" not in raw:
-            self._unauthorized()
             return False
         u, p = raw.split(":", 1)
-        if u != USER or p != PASSWORD:
-            self._unauthorized()
-            return False
-        return True
+        return u == USER and p == PASSWORD
+
+    def _check_auth(self) -> bool:
+        if self._basic_ok():
+            return True
+        self._unauthorized()
+        return False
+
+    def _check_auth_or_unlock(self) -> bool:
+        """终端页粘贴图片：Basic（浏览器缓存）或 PIN unlock Cookie 均可。"""
+        if self._basic_ok() or self._has_valid_unlock():
+            return True
+        self._unauthorized()
+        return False
 
     def _send(self, code: int, body: bytes, content_type: str, extra_headers: list[tuple[str, str]] | None = None) -> None:
         self.send_response(code)
@@ -888,10 +1019,13 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if not self._check_auth():
-            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        if path == "/api/paste-image":
+            if not self._check_auth_or_unlock():
+                return
+        elif not self._check_auth():
+            return
         length = int(self.headers.get("Content-Length", "0") or 0)
         raw = self.rfile.read(length) if length else b"{}"
         try:
@@ -945,6 +1079,46 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
                 return
             self._json(200, {"ok": True, "result": result})
+            return
+
+        if path == "/api/paste-image":
+            mime = str(data.get("mime") or "image/png")
+            b64 = str(data.get("image_base64") or "")
+            if not b64:
+                self._json(400, {"error": "缺少 image_base64"})
+                return
+            try:
+                img_raw = base64.b64decode(b64, validate=False)
+            except Exception:
+                self._json(400, {"error": "base64 无效"})
+                return
+            # 默认写剪贴板；前端可传 set_clipboard=false 避免用坏图覆盖
+            set_clip = data.get("set_clipboard", True)
+            if isinstance(set_clip, str):
+                set_clip = set_clip.strip().lower() in ("1", "true", "yes")
+            else:
+                set_clip = bool(set_clip)
+            try:
+                path_out, clip_ok, width, height = save_paste_image(
+                    img_raw, mime, set_clipboard=set_clip
+                )
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            except RuntimeError as e:
+                self._json(500, {"error": str(e)})
+                return
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "path": str(path_out),
+                    "clipboard": clip_ok,
+                    "width": width,
+                    "height": height,
+                    "bytes": len(img_raw),
+                },
+            )
             return
 
         self._json(404, {"error": "not found"})

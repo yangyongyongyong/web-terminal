@@ -122,9 +122,12 @@ def test_index_inject_contains_policy() -> None:
     for needle in (
         'id="wt-wheel"',
         'id="wt-reconnect"',
+        'id="wt-paste-image"',
         "decideWheelAction",
         "swallow",
         "WtWheel.hookLocalWheel",
+        "WtPasteImage.hookPasteImage",
+        "/api/paste-image",
     ):
         if needle not in html:
             fail(f"ttyd-index.html 缺少注入: {needle}")

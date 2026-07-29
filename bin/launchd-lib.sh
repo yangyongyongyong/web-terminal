@@ -25,6 +25,23 @@ remove_old_agents() {
   done
 }
 
+# 只清 ttyd/manage/healthcheck 的旧 Agent，默认不动 cloudflared（可能共用隧道）
+remove_old_agents_app_only() {
+  local name uid_num
+  uid_num="$(id -u)"
+  for name in \
+    uk.lucadesign.web-terminal.ttyd \
+    uk.lucadesign.web-terminal.manage \
+    uk.lucadesign.web-terminal.healthcheck
+  do
+    if launchctl print "gui/${uid_num}/${name}" &>/dev/null; then
+      launchctl bootout "gui/${uid_num}/${name}" 2>/dev/null || true
+      echo "已移除旧 LaunchAgent: ${name}"
+    fi
+    rm -f "${AGENT_DIR}/${name}.plist"
+  done
+}
+
 install_daemon() {
   local name="$1"
   local src="${ROOT}/config/${name}.plist"
