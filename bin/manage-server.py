@@ -69,7 +69,7 @@ MANAGE_HTML = r"""<!DOCTYPE html>
       radial-gradient(900px 500px at 100% 0%, #14352c 0%, transparent 50%),
       var(--bg);
   }
-  main { max-width: 980px; margin: 0 auto; padding: 40px 20px 80px; }
+  main { max-width: min(1320px, 96vw); margin: 0 auto; padding: 32px 24px 80px; }
   header { margin-bottom: 28px; }
   h1 { margin: 0 0 6px; font-size: 28px; letter-spacing: -0.02em; }
   .sub { color: var(--muted); }
@@ -94,17 +94,38 @@ MANAGE_HTML = r"""<!DOCTYPE html>
   button.secondary { background: #2b3645; }
   button.danger { background: var(--danger); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  #listWrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; min-width: 720px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
   th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
-  .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); word-break: break-all; }
+  th.chk, td.chk { width: 36px; }
+  th.status-col, td.status-cell { width: 52px; }
+  th.name-col, td.name-cell { width: 18%; }
+  th.path-col { width: auto; }
+  th.time-col, td.time-cell {
+    width: 148px; white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; color: var(--muted);
+  }
+  th.act-col, td.actions { width: 148px; }
+  .path {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .path:hover { white-space: normal; word-break: break-all; }
   .tag {
     display: inline-block; padding: 2px 8px; border-radius: 999px;
     font-size: 12px; background: #243041; color: var(--muted);
   }
   .tag.on { background: rgba(61,214,140,.15); color: var(--ok); }
   .tag.off { background: rgba(245,165,36,.12); color: var(--warn); }
-  .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .actions {
+    display: flex; gap: 8px; flex-wrap: nowrap; align-items: center;
+    white-space: nowrap;
+  }
+  .actions button { padding: 7px 12px; flex: 0 0 auto; }
   .empty { color: var(--muted); padding: 16px 4px; }
   .flash { margin: 0 0 14px; padding: 10px 12px; border-radius: 8px; background: #1e2a38; color: var(--muted); }
   .flash.err { background: rgba(243,18,96,.12); color: #ff8fab; }
@@ -215,6 +236,21 @@ function flash(msg, isErr) {
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/** 2026-07-28T20:57:54+0800 → 20260728 20:57:54 */
+function formatTime(raw) {
+  const s = String(raw || '').trim();
+  if (!s || s === '-') return '-';
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
+  if (m) return m[1] + m[2] + m[3] + ' ' + m[4] + ':' + m[5] + ':' + m[6];
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) {
+    const p = n => String(n).padStart(2, '0');
+    return '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate())
+      + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+  return s;
 }
 
 function histKey(name, cwd) {
@@ -407,11 +443,11 @@ function renderList() {
   const allChecked = keys.length && keys.every(k => rowSelected.has(k));
   let html = '<table><thead><tr>' +
     '<th class="chk"><input type="checkbox" id="rowCheckAll"' + (allChecked ? ' checked' : '') + '></th>' +
-    '<th class="sortable" data-sort="status">状态' + sortArrow('status') + '</th>' +
-    '<th class="sortable" data-sort="name">名称' + sortArrow('name') + '</th>' +
-    '<th class="sortable" data-sort="path">路径' + sortArrow('path') + '</th>' +
-    '<th class="sortable" data-sort="time">时间' + sortArrow('time') + '</th>' +
-    '<th></th></tr></thead><tbody>';
+    '<th class="sortable status-col" data-sort="status">状态' + sortArrow('status') + '</th>' +
+    '<th class="sortable name-col" data-sort="name">名称' + sortArrow('name') + '</th>' +
+    '<th class="sortable path-col" data-sort="path">路径' + sortArrow('path') + '</th>' +
+    '<th class="sortable time-col" data-sort="time">时间' + sortArrow('time') + '</th>' +
+    '<th class="act-col"></th></tr></thead><tbody>';
   for (const s of filtered) {
     const key = rowKey(s);
     const checked = rowSelected.has(key) ? ' checked' : '';
@@ -419,9 +455,9 @@ function renderList() {
     html += `<tr>
       <td class="chk"><input type="checkbox" class="row-chk" data-key="${esc(key)}"${checked}></td>
       <td class="status-cell">${dot}</td>
-      <td><button type="button" class="name-edit" data-rename="${esc(s.name)}" title="点击修改名称">${esc(s.name)}</button></td>
-      <td class="path">${esc(s.path || '-')}</td>
-      <td>${esc(s.time || '-')}</td>
+      <td class="name-cell"><button type="button" class="name-edit" data-rename="${esc(s.name)}" title="点击修改名称">${esc(s.name)}</button></td>
+      <td class="path" title="${esc(s.path || '')}">${esc(s.path || '-')}</td>
+      <td class="time-cell">${esc(formatTime(s.time))}</td>
       <td class="actions">
         <button type="button" data-open-row="${esc(key)}">open</button>
         ${s.live

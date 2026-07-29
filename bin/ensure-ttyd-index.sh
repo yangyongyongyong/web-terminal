@@ -9,6 +9,12 @@ INDEX="${ROOT}/web/ttyd-index.html"
 
 mkdir -p "${ROOT}/web"
 
+if [[ -f "${INDEX}" ]] && grep -q 'id="wt-reconnect"' "${INDEX}" && [[ -f "${STOCK}" ]]; then
+  # stock 在时始终按最新注入脚本重生成 index
+  python3 "${ROOT}/bin/patch-ttyd-index.py"
+  exit $?
+fi
+
 if [[ -f "${INDEX}" ]] && grep -q 'id="wt-reconnect"' "${INDEX}"; then
   exit 0
 fi

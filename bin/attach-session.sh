@@ -83,4 +83,9 @@ if ! "${TMUX_BIN}" has-session -t "${session}" 2>/dev/null; then
 fi
 
 touch_meta last_open "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+# 注意：不要在 attach 前 capture-pane 灌历史。
+# 经 ttyd WebSocket 逐行回放会看起来像「从顶部一直滚到底」，
+# 且与 xterm 是否已在底部无关——那是输出流在刷，不是视口位置问题。
+# 浏览器 scrollback 只累积本次连接期间滚出的行；跨刷新的深历史用 Shift+PgUp / tmux copy-mode。
 exec "${TMUX_BIN}" -f "${TMUX_CONF}" attach-session -t "${session}"

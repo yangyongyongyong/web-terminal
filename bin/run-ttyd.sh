@@ -23,6 +23,9 @@ TTYD_BIN="$(command -v ttyd)"
 INDEX_HTML="${ROOT}/web/ttyd-index.html"
 ATTACH="${ROOT}/bin/attach-session.sh"
 BASE_PATH="${TTYD_BASE_PATH:-/term}"
+# 约 SCROLLBACK_PAGES 页（按 50 行/页）；xterm 本地 scrollback，滚轮不走公网
+SCROLLBACK_LINES=$(( ${SCROLLBACK_PAGES:-30} * 50 ))
+if [[ "${SCROLLBACK_LINES}" -lt 200 ]]; then SCROLLBACK_LINES=200; fi
 
 # 端口：对内仍 7681；对外经 Cloudflare path /term
 TTYD_ARGS=(
@@ -42,6 +45,7 @@ TTYD_ARGS=(
   --client-option "cursorBlink=true"
   --client-option "fontSize=15"
   --client-option "fontFamily=Menlo, Monaco, 'Courier New', monospace"
+  --client-option "scrollback=${SCROLLBACK_LINES}"
 )
 
 # 每个浏览器连接：attach-session.sh <name> [create]
