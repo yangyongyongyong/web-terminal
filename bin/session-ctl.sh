@@ -70,7 +70,7 @@ pane_cwd() {
 }
 
 cmd_list() {
-  local line sid name created last_open clients cwd now
+  local line sid name created last_open clients cwd now pages
   while IFS= read -r line; do
     [[ -z "${line}" ]] && continue
     sid="${line}"
@@ -78,12 +78,100 @@ cmd_list() {
     created="$(meta_get "${sid}" created)"
     last_open="$(meta_get "${sid}" last_open)"
     cwd="$(meta_get "${sid}" cwd)"
+    pages="$(meta_get "${sid}" pages)"
     now="$(pane_cwd "${sid}")"
     [[ -z "${cwd}" || "${cwd}" == "-" ]] && cwd="${now:--}"
     clients="$("${TMUX_BIN}" list-clients -t "${sid}" 2>/dev/null | wc -l | tr -d ' ')"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${name}" "${sid}" "${created:--}" "${last_open:--}" "${clients}" "${cwd:--}" "${now:--}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${name}" "${sid}" "${created:--}" "${last_open:--}" "${clients}" "${cwd:--}" "${now:--}" "${pages:--}"
   done < <("${TMUX_BIN}" list-sessions -F '#{session_name}' 2>/dev/null | grep '^wt-' || true)
+}
+
+# 全局默认回看页数：run/scrollback-pages（管理页可改；缺省回落 .env 的 SCROLLBACK_PAGES）
+DEFAULT_PAGES_FILE="${ROOT}/run/scrollback-pages"
+
+cmd_default_pages() {
+  local pages="${1:-}"
+  if [[ -z "${pages}" ]]; then
+    echo "${SCROLLBACK_PAGES:-30}"   # common.sh 已把运行时文件并入
+    return 0
+  fi
+  if ! [[ "${pages}" =~ ^[0-9]+$ ]] || [[ "${pages}" -lt 1 ]]; then
+    echo "全局默认页数必须是 >=1 的整数: ${pages}" >&2
+    exit 1
+  fi
+  printf '%s\n' "${pages}" >"${DEFAULT_PAGES_FILE}.tmp"
+  mv -f "${DEFAULT_PAGES_FILE}.tmp" "${DEFAULT_PAGES_FILE}"
+  echo "default-pages:${pages}"
+}
+
+# 每会话滚动历史页数：读/写 run/sessions/wt-<name>.pages
+# pages=0 表示删除该会话配置 → 回落全局默认
+cmd_set_pages() {
+  local name sid pages
+  name="$(sanitize "${1:-}")"
+  pages="${2:-}"
+  if [[ -z "${name}" ]]; then
+    echo "需要会话名" >&2
+    exit 1
+  fi
+  if ! [[ "${pages}" =~ ^[0-9]+$ ]]; then
+    echo "页数必须是非负整数(0=用全局默认): ${pages}" >&2
+    exit 1
+  fi
+  sid="$(session_id "${name}")"
+  if [[ "${pages}" -eq 0 ]]; then
+    rm -f "${META_DIR}/${sid}.pages"
+    echo "pages:${name}:default"
+    return 0
+  fi
+  meta_set "${sid}" pages "${pages}"
+  echo "pages:${name}:${pages}"
+}
+
+# 更新历史记录里已停止会话的页数(name+cwd 定位)
+cmd_history_set_pages() {
+  local name cwd pages
+  name="$(sanitize "${1:-}")"
+  cwd="${2:-}"
+  pages="${3:-}"
+  if [[ -z "${name}" ]]; then
+    echo "需要会话名" >&2
+    exit 1
+  fi
+  if ! [[ "${pages}" =~ ^[0-9]+$ ]]; then
+    echo "页数必须是非负整数(0=用全局默认): ${pages}" >&2
+    exit 1
+  fi
+  /opt/homebrew/bin/python3 - "${name}" "${cwd}" "${pages}" "${HISTORY_FILE}" <<'PY'
+import json, sys
+from pathlib import Path
+name, cwd, pages, path = sys.argv[1:5]
+p = Path(path)
+if not p.exists():
+    print("missing")
+    raise SystemExit(0)
+items = []
+changed = 0
+for line in p.read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if obj.get("name") == name and (obj.get("cwd") or "") == (cwd or ""):
+        obj = dict(obj)
+        if int(pages) <= 0:
+            obj.pop("pages", None)   # 0 = 不配置，回落全局默认
+        else:
+            obj["pages"] = int(pages)
+        changed += 1
+    items.append(obj)
+p.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in items), encoding="utf-8")
+print(f"pages:{changed}")
+PY
 }
 
 cmd_create() {
@@ -112,7 +200,7 @@ cmd_create() {
 }
 
 cmd_kill() {
-  local name sid created last_open cwd purge=0
+  local name sid created last_open cwd pages purge=0
   name="$(sanitize "${1:-}")"
   if [[ "${2:-}" == "--purge" || "${2:-}" == "purge" ]]; then
     purge=1
@@ -156,14 +244,15 @@ PY
   fi
   created="$(meta_get "${sid}" created)"
   last_open="$(meta_get "${sid}" last_open)"
+  pages="$(meta_get "${sid}" pages)"
   # 记住停止当下的实际工作目录，下次 open 从这里恢复
   cwd="$(pane_cwd "${sid}")"
   [[ -z "${cwd}" ]] && cwd="$(meta_get "${sid}" cwd)"
   "${TMUX_BIN}" kill-session -t "${sid}"
-  /opt/homebrew/bin/python3 - "${name}" "${sid}" "${created}" "${last_open}" "${cwd}" "${HISTORY_FILE}" <<'PY'
+  /opt/homebrew/bin/python3 - "${name}" "${sid}" "${created}" "${last_open}" "${cwd}" "${pages}" "${HISTORY_FILE}" <<'PY'
 import json, sys, datetime
 from pathlib import Path
-name, sid, created, last_open, cwd, path = sys.argv[1:7]
+name, sid, created, last_open, cwd, pages, path = sys.argv[1:8]
 rec = {
     "name": name,
     "sid": sid,
@@ -172,6 +261,8 @@ rec = {
     "cwd": cwd or "",
     "stopped": datetime.datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
 }
+if pages and pages.isdigit():
+    rec["pages"] = int(pages)
 p = Path(path)
 items = []
 if p.exists():
@@ -348,7 +439,7 @@ PY
 }
 
 usage() {
-  echo "用法: $0 list|create <name> [cwd]|kill <name> [--purge]|rename <old> <new>|history|history-del <name> [cwd]|resolve [cwd]" >&2
+  echo "用法: $0 list|create <name> [cwd]|kill <name> [--purge]|rename <old> <new>|history|history-del <name> [cwd]|set-pages <name> <n|0>|history-set-pages <name> <cwd> <n|0>|default-pages [n]|resolve [cwd]" >&2
   exit 1
 }
 
@@ -359,6 +450,9 @@ case "${1:-}" in
   rename) cmd_rename "${2:-}" "${3:-}" ;;
   history) cmd_history ;;
   history-del) cmd_history_del "${2:-}" "${3:-}" ;;
+  default-pages) cmd_default_pages "${2:-}" ;;
+  set-pages) cmd_set_pages "${2:-}" "${3:-}" ;;
+  history-set-pages) cmd_history_set_pages "${2:-}" "${3:-}" "${4:-}" ;;
   resolve) cmd_resolve "${2:-}" ;;
   *) usage ;;
 esac

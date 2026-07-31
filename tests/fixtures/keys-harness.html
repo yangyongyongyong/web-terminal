@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>wt keys harness</title></head>
+<body><div id="wt-status"></div>
+<!-- 被测源码：浏览器里以 window.WtPasteImage 形式加载 -->
+<script src="../../web/wt-paste-image.js"></script>
+<script>
+// 由 tests/browser-keys.mjs 通过 CDP 调 window.__run() 收集结果（真实时间，非 virtual time）
+const R = [], note = (k, v) => R.push(k + '=' + v);
+const tick = (ms) => new Promise(r => setTimeout(r, ms || 30));
+const status = () => document.getElementById('wt-status').textContent;
+let posts = [], PNG = null;
+
+function setPlatform(plat, ua) {
+  Object.defineProperty(navigator, 'userAgentData', { value: undefined, configurable: true });
+  Object.defineProperty(navigator, 'platform', { value: plat, configurable: true });
+  Object.defineProperty(navigator, 'userAgent', { value: ua, configurable: true });
+}
+function setClipboardApi(readFn) {
+  Object.defineProperty(navigator, 'clipboard', {
+    value: readFn ? { read: readFn } : undefined, configurable: true });
+}
+function makeTerm() {
+  const t = { inputs: [], pastes: [] };
+  t.attachCustomKeyEventHandler = (fn) => { t.handler = fn; };
+  t.input = (s) => t.inputs.push(s);
+  t.paste = (s) => t.pastes.push(s);
+  t.focus = () => {};
+  return t;
+}
+function kev(o) {
+  let pd = false;
+  const ev = Object.assign({ type: 'keydown', code: 'KeyV', preventDefault: () => { pd = true; } }, o);
+  Object.defineProperty(ev, 'pd', { get: () => pd });
+  return ev;
+}
+function dtWith({ image, text }) {
+  const dt = new DataTransfer();
+  if (image) dt.items.add(new File([PNG], 'a.png', { type: 'image/png' }));
+  if (text) dt.setData('text/plain', text);
+  return dt;
+}
+const pasteEv = (dt) => new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+async function settle() { await tick(30); try { await WtPasteImage.pendingUpload(); } catch (e) {} await tick(10); }
+
+window.fetch = async (url, opts) => {
+  posts.push({ url: String(url), body: JSON.parse(opts.body) });
+  return { ok: true, status: 200, json: async () => ({ ok: true, path: '/tmp/x.png', clipboard: true, width: 40, height: 40 }) };
+};
+
+window.__run = async () => {
+  try {
+    PNG = await new Promise(res => {
+      const c = document.createElement('canvas'); c.width = 40; c.height = 40;
+      const x = c.getContext('2d'); x.fillStyle = '#c81e1e'; x.fillRect(0, 0, 40, 40);
+      c.toBlob(res, 'image/png');
+    });
+
+    // ================= 非 mac 客户端（Windows） =================
+    setPlatform('Win32', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
+    note('platform', WtPasteImage.detectPlatform());
+    var term = makeTerm();
+    WtPasteImage.hookPasteImage(() => term);
+    note('hookKeys', WtPasteImage.hookKeys(() => term));
+
+    // Ctrl+V：不 preventDefault、不发 \x16 → 让浏览器原生粘贴（xterm 贴文本）
+    let e = kev({ ctrlKey: true });
+    note('winCtrlV', 'ret:' + term.handler(e) + ' pd:' + e.pd + ' toPTY:' + term.inputs.length);
+
+    // Ctrl+Alt+V：逃生阀，发原始 ^V
+    e = kev({ ctrlKey: true, altKey: true });
+    note('winCtrlAltV', 'ret:' + term.handler(e) + ' pd:' + e.pd + ' toPTY:' + JSON.stringify(term.inputs));
+
+    // Alt+V + 剪贴板 API 可用 → 上传（强制写 mac 剪贴板）并发 ^V
+    posts = []; term = makeTerm(); WtPasteImage.hookKeys(() => term);
+    setClipboardApi(async () => [{ types: ['image/png'], getType: async () => PNG }]);
+    e = kev({ altKey: true }); term.handler(e); await settle();
+    note('winAltV', 'pd:' + e.pd + ' posts:' + posts.length + ' set_clipboard:' + (posts[0] && posts[0].body.set_clipboard) + ' toPTY:' + JSON.stringify(term.inputs));
+
+    // Alt+V + 剪贴板 API 不可用（局域网 http）→ 引导浮层
+    posts = []; term = makeTerm(); WtPasteImage.hookKeys(() => term);
+    setClipboardApi(null);
+    e = kev({ altKey: true }); term.handler(e); await tick(20);
+    note('winAltVoverlay', !!document.getElementById(WtPasteImage.OVERLAY_ID));
+    let ce = pasteEv(dtWith({ image: true })); document.body.dispatchEvent(ce); await settle();
+    note('overlayPaste', 'prevented:' + ce.defaultPrevented + ' posts:' + posts.length + ' closed:' + !document.getElementById(WtPasteImage.OVERLAY_ID) + ' toPTY:' + JSON.stringify(term.inputs));
+
+    // 浮层里剪贴板没有图 → 拦住并提示
+    posts = []; term = makeTerm(); WtPasteImage.hookKeys(() => term);
+    e = kev({ altKey: true }); term.handler(e); await tick(20);
+    ce = pasteEv(dtWith({ text: 'nope' })); document.body.dispatchEvent(ce); await settle();
+    note('overlayNoImage', 'prevented:' + ce.defaultPrevented + ' posts:' + posts.length + ' closed:' + !document.getElementById(WtPasteImage.OVERLAY_ID) + ' status:' + status());
+
+    // 原生 Ctrl+V：图+文 → 放行给 xterm 贴文本
+    posts = []; ce = pasteEv(dtWith({ image: true, text: 'hello' })); document.body.dispatchEvent(ce); await settle();
+    note('winPasteImageAndText', 'prevented:' + ce.defaultPrevented + ' posts:' + posts.length);
+
+    // 原生 Ctrl+V：只有图 → 兜底贴图
+    posts = []; ce = pasteEv(dtWith({ image: true })); document.body.dispatchEvent(ce); await settle();
+    note('winPasteImageOnly', 'prevented:' + ce.defaultPrevented + ' posts:' + posts.length + ' set_clipboard:' + (posts[0] && posts[0].body.set_clipboard));
+
+    // ================= mac 客户端 =================
+    setPlatform('MacIntel', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)');
+    note('platform2', WtPasteImage.detectPlatform());
+    term = makeTerm(); WtPasteImage.hookKeys(() => term);
+    e = kev({ ctrlKey: true }); const r1 = term.handler(e);
+    const e2 = kev({ altKey: true }); const r2 = term.handler(e2);
+    note('macKeys', 'ctrlV:' + r1 + '/pd:' + e.pd + ' altV:' + r2 + '/pd:' + e2.pd + ' toPTY:' + term.inputs.length);
+
+    posts = []; ce = pasteEv(dtWith({ image: true, text: 'hi' })); document.body.dispatchEvent(ce); await settle();
+    note('macPasteImageAndText', 'prevented:' + ce.defaultPrevented + ' posts:' + posts.length + ' set_clipboard:' + (posts[0] && posts[0].body.set_clipboard));
+
+    posts = []; ce = pasteEv(dtWith({ text: 'only text' })); document.body.dispatchEvent(ce); await settle();
+    note('macPasteTextOnly', 'prevented:' + ce.defaultPrevented + ' posts:' + posts.length);
+  } catch (err) {
+    note('ERR', String((err && err.stack) || err).slice(0, 300));
+  }
+  return R;
+};
+</script></body></html>

@@ -48,6 +48,115 @@ PATH_ROOT = str(Path(ENV.get("SESSION_PATH_ROOT") or HOME).expanduser())
 DEFAULT_PATH = str(Path(ENV.get("SESSION_DEFAULT_PATH") or HOME).expanduser())
 SESSION_CTL = str(ROOT / "bin" / "session-ctl.sh")
 NAME_RE = re.compile(r"^[\w\-]{1,64}$")  # 含中文等 Unicode 字母数字；不含 . : / 空白
+TTYD_PORT = int(ENV.get("TTYD_PORT", "7681"))
+TTYD_BASE_PATH = (ENV.get("TTYD_BASE_PATH") or "/term").rstrip("/") or "/term"
+
+
+def _lan_ip_rank(ip: str) -> int:
+    """给候选 IPv4 打分：真正的家用/办公局域网段优先，VPN/基准/保留段靠后。
+    分数越大越优先；<=0 表示不适合作为局域网直连地址。"""
+    if not ip or ip.startswith("127.") or ip.startswith("169.254."):
+        return -1
+    try:
+        a, b = (int(x) for x in ip.split(".")[:2])
+    except ValueError:
+        return -1
+    if a == 192 and b == 168:
+        return 100  # 最常见家用/办公 Wi-Fi
+    if a == 10:
+        return 90
+    if a == 172 and 16 <= b <= 31:
+        return 80
+    if a == 198 and b in (18, 19):
+        return 1   # 198.18/15 基准测试段：常被 VPN/透明代理占用，局域网设备通常不可达
+    if a == 100 and 64 <= b <= 127:
+        return 2   # 100.64/10 CGNAT：运营商级，局域网内多半不可直连
+    return 50      # 其它可路由/私有地址：可用但不如标准私有段
+
+
+def _candidate_ipv4s() -> list[str]:
+    import socket
+
+    found: list[str] = []
+
+    def add(ip: str) -> None:
+        if ip and ip not in found:
+            found.append(ip)
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))  # 不真正发包，只让内核选出出口地址
+            add(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        pass
+    try:
+        add_all = socket.gethostbyname_ex(socket.gethostname())[2]
+        for ip in add_all:
+            add(ip)
+    except OSError:
+        pass
+    # macOS/Linux：枚举所有网卡地址，覆盖 Wi-Fi/有线，避免只拿到 VPN 出口
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["ifconfig"], capture_output=True, text=True, timeout=2
+        ).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("inet ") and "inet6" not in line:
+                add(line.split()[1])
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return found
+
+
+def detect_lan_ip() -> str:
+    """返回本机最适合局域网直连的 IPv4;失败返回空串。用于让同网设备低延迟直连。
+    优先标准私有段(192.168/10/172.16-31),排除 VPN 基准段与 CGNAT。"""
+    best = ""
+    best_rank = 0
+    for ip in _candidate_ipv4s():
+        r = _lan_ip_rank(ip)
+        if r > best_rank:
+            best_rank = r
+            best = ip
+    return best
+
+
+MAX_PAGES = 2000  # 上限护栏：避免误填超大值把浏览器内存吃满
+PAGES_FILE = ROOT / "run" / "scrollback-pages"  # 全局默认（管理页可改，运行时生效）
+
+
+def _env_default_pages() -> int:
+    raw = (ENV.get("SCROLLBACK_PAGES") or "30").split("#", 1)[0].strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 30
+
+
+def default_pages() -> int:
+    """全局默认回看页数：run/scrollback-pages > .env SCROLLBACK_PAGES > 30。
+    每次读取文件，管理页改完立即生效，无需重启。"""
+    try:
+        raw = PAGES_FILE.read_text(encoding="utf-8").strip()
+        n = int(raw)
+        if 1 <= n <= MAX_PAGES:
+            return n
+    except (OSError, ValueError):
+        pass
+    return _env_default_pages()
+
+
+def set_default_pages(pages: int) -> None:
+    PAGES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PAGES_FILE.with_suffix(".tmp")
+    tmp.write_text(f"{int(pages)}\n", encoding="utf-8")
+    tmp.replace(PAGES_FILE)
 PASTE_DIR = ROOT / "run" / "paste-images"
 PASTE_MAX_BYTES = 12 * 1024 * 1024
 PASTE_MIME_EXT = {
@@ -80,7 +189,7 @@ MANAGE_HTML = r"""<!DOCTYPE html>
       radial-gradient(900px 500px at 100% 0%, #14352c 0%, transparent 50%),
       var(--bg);
   }
-  main { max-width: min(1320px, 96vw); margin: 0 auto; padding: 32px 24px 80px; }
+  main { width: 100%; max-width: 2400px; margin: 0 auto; padding: 28px clamp(14px, 2vw, 36px) 72px; }
   header { margin-bottom: 28px; }
   h1 { margin: 0 0 6px; font-size: 28px; letter-spacing: -0.02em; }
   .sub { color: var(--muted); }
@@ -111,7 +220,8 @@ MANAGE_HTML = r"""<!DOCTYPE html>
   th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
   th.chk, td.chk { width: 36px; }
   th.status-col, td.status-cell { width: 52px; }
-  th.name-col, td.name-cell { width: 18%; }
+  th.name-col, td.name-cell { width: 220px; }
+  td.name-cell { overflow: hidden; }
   th.path-col { width: auto; }
   th.time-col, td.time-cell {
     width: 148px; white-space: nowrap;
@@ -119,7 +229,7 @@ MANAGE_HTML = r"""<!DOCTYPE html>
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 12px; color: var(--muted);
   }
-  th.act-col, td.actions { width: 148px; }
+  th.act-col, td.actions { width: 212px; }
   .path {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 12px; color: var(--muted);
@@ -140,6 +250,9 @@ MANAGE_HTML = r"""<!DOCTYPE html>
   .empty { color: var(--muted); padding: 16px 4px; }
   .flash { margin: 0 0 14px; padding: 10px 12px; border-radius: 8px; background: #1e2a38; color: var(--muted); }
   .flash.err { background: rgba(243,18,96,.12); color: #ff8fab; }
+  .lanbar { margin: 0 0 14px; padding: 10px 12px; border-radius: 8px; background: rgba(46,160,67,.12); color: #7ee787; font-size: 13px; line-height: 1.6; }
+  .lanbar code { background: rgba(0,0,0,.25); padding: 1px 6px; border-radius: 4px; color: #d2e6ff; user-select: all; }
+  .lanbar .muted { color: var(--muted); }
   .hint { font-size: 12px; color: var(--muted); margin: -4px 0 10px; }
   input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
   th.sortable { cursor: pointer; user-select: none; }
@@ -156,8 +269,18 @@ MANAGE_HTML = r"""<!DOCTYPE html>
     appearance: none; border: 0; background: transparent; color: var(--text);
     font: inherit; font-weight: 700; padding: 0; margin: 0; cursor: pointer;
     text-align: left; border-bottom: 1px dashed color-mix(in srgb, var(--muted) 55%, transparent);
+    display: block; max-width: 100%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .name-edit:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  th.pages-col, td.pages-cell { width: 96px; white-space: nowrap; }
+  .pages-edit {
+    appearance: none; border: 0; background: transparent; color: var(--text);
+    font: inherit; padding: 0; margin: 0; cursor: pointer; text-align: left;
+    border-bottom: 1px dashed color-mix(in srgb, var(--muted) 55%, transparent);
+  }
+  .pages-edit:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  .pages-edit.is-default { color: var(--muted); }
   .modal-mask {
     position: fixed; inset: 0; z-index: 10000;
     background: rgba(0,0,0,.55);
@@ -181,6 +304,7 @@ MANAGE_HTML = r"""<!DOCTYPE html>
     <p class="sub">进入终端需二次验证（24 小时内免重复输入）· 新建使用默认工作目录</p>
   </header>
   <div id="flash" class="flash" hidden></div>
+  <div id="lanBar" class="lanbar" hidden></div>
 
   <section class="card">
     <div class="row">
@@ -193,10 +317,11 @@ MANAGE_HTML = r"""<!DOCTYPE html>
     <div class="row" style="justify-content:space-between;align-items:center">
       <h2 style="margin:0;font-size:16px">会话</h2>
       <div class="actions">
+        <button id="btnDefaultPages" class="secondary" type="button" title="设置全局默认回看页数">全局回看…</button>
         <button id="btnBulkDel" class="danger" type="button">删除选中</button>
       </div>
     </div>
-    <p class="hint" style="margin-top:8px"><span class="dot green"></span> 可恢复 &nbsp;&nbsp; <span class="dot red"></span> 已断开</p>
+    <p class="hint" style="margin-top:8px"><span class="dot green"></span> 可恢复 &nbsp;&nbsp; <span class="dot red"></span> 已断开 &nbsp;&nbsp; 回看列显示「默认 N」= 未单独配置，跟随全局</p>
     <div id="listWrap"><p class="empty">加载中…</p></div>
   </section>
 </main>
@@ -225,15 +350,47 @@ MANAGE_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div id="pagesModal" class="modal-mask" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pagesTitle">
+    <h3 id="pagesTitle">回看页数</h3>
+    <p id="pagesHint">设置本会话滚轮回看的历史页数</p>
+    <input id="pagesInput" type="text" inputmode="numeric" autocomplete="off" placeholder="留空 = 用全局默认">
+    <div class="row">
+      <button id="pagesCancel" class="secondary" type="button">取消</button>
+      <button id="pagesReset" class="secondary" type="button">恢复默认</button>
+      <button id="pagesConfirm" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const termBase = '/term/';
 let pending = null;
-let nameModalMode = null; // { type: 'create' } | { type: 'rename', oldName }
+let nameModalMode = null; // { type: 'create' } | { type: 'rename', oldName } | { type: 'clone', cwd, srcName }
 let cache = { sessions: [], history: [], path_root: '', default_path: '' };
 const rowSelected = new Set(); // name + \\u001e + cwd + \\u001e + live|dead
 let lastRowChkIndex = null; // 多选：普通点击锚点，供 Shift 范围选取
 let sortKey = 'status';
 let sortDir = 1; // 1 asc, -1 desc
+
+// 局域网直连：若当前不是经 Cloudflare 隧道（公网域名）访问，则没有 /term 路径路由，
+// 需把票据返回的相对 /term/… 改写成 http://<本机>:<ttyd端口>/term/…，延迟更低。
+function offTunnel() {
+  const pub = cache && cache.public_host;
+  return !!pub && location.hostname !== pub;
+}
+
+function resolveTermUrl(relUrl) {
+  if (!offTunnel() || !cache.ttyd_port) return relUrl;
+  try {
+    // relUrl 形如 /term/?arg=...；保留其 path+query，仅换 host:port
+    const u = new URL(relUrl, location.origin);
+    return location.protocol + '//' + location.hostname + ':' + cache.ttyd_port + u.pathname + u.search;
+  } catch (e) {
+    return relUrl;
+  }
+}
+
 
 function isValidSessionName(name) {
   return /^[\p{L}\p{N}_-]{1,64}$/u.test(name || '');
@@ -302,6 +459,7 @@ function mergedRows() {
     clients: s.clients || 0,
     time: s.last_open || s.created || '',
     created: s.created || '',
+    pages: Number(s.pages) || 0,
   }));
   const liveNames = new Set(live.map(s => s.name));
   const dead = (cache.history || [])
@@ -314,6 +472,7 @@ function mergedRows() {
       clients: 0,
       time: h.stopped || h.last_open || h.created || '',
       created: h.created || '',
+      pages: Number(h.pages) || 0,
     }));
   return live.concat(dead);
 }
@@ -400,7 +559,7 @@ async function fetchTicketUrl(item, pin) {
 async function tryOpen(item, hint) {
   try {
     const url = await fetchTicketUrl(item, '');
-    openTermTab(url);
+    openTermTab(resolveTermUrl(url));
     flash('已在新标签打开会话');
     await refresh();
   } catch (e) {
@@ -422,7 +581,7 @@ async function submitPin() {
   try {
     const url = await fetchTicketUrl(item, pin);
     closePin();
-    openTermTab(url);
+    openTermTab(resolveTermUrl(url));
     flash('已在新标签打开会话');
     await refresh();
   } catch (e) {
@@ -458,20 +617,30 @@ function renderList() {
     '<th class="sortable status-col" data-sort="status">状态' + sortArrow('status') + '</th>' +
     '<th class="sortable name-col" data-sort="name">名称' + sortArrow('name') + '</th>' +
     '<th class="sortable path-col" data-sort="path">路径' + sortArrow('path') + '</th>' +
+    '<th class="pages-col" title="每会话可单独配置；未配置则用全局默认">回看</th>' +
     '<th class="sortable time-col" data-sort="time">时间' + sortArrow('time') + '</th>' +
     '<th class="act-col"></th></tr></thead><tbody>';
   for (const s of filtered) {
     const key = rowKey(s);
     const checked = rowSelected.has(key) ? ' checked' : '';
     const dot = s.live ? '<span class="dot green" title="可恢复"></span>' : '<span class="dot red" title="已断开"></span>';
+    const defPages = Number(cache.default_pages) || 30;
+    const inherited = !(s.pages > 0);
+    const pagesLabel = inherited ? ('默认 ' + defPages) : (s.pages + ' 页');
+    const pagesCls = inherited ? 'pages-edit is-default' : 'pages-edit';
+    const pagesTitle = inherited
+      ? '未单独配置，跟随全局默认 ' + defPages + ' 页；点击可单独设置'
+      : '本会话单独配置 ' + s.pages + ' 页；点击可改回跟随全局';
     html += `<tr>
       <td class="chk"><input type="checkbox" class="row-chk" data-key="${esc(key)}"${checked}></td>
       <td class="status-cell">${dot}</td>
       <td class="name-cell"><button type="button" class="name-edit" data-rename="${esc(s.name)}" title="点击修改名称">${esc(s.name)}</button></td>
       <td class="path" title="${esc(s.path || '')}">${esc(s.path || '-')}</td>
+      <td class="pages-cell"><button type="button" class="${pagesCls}" data-pages="${esc(key)}" title="${esc(pagesTitle)}">${esc(pagesLabel)}</button></td>
       <td class="time-cell">${esc(formatTime(s.time))}</td>
       <td class="actions">
         <button type="button" data-open-row="${esc(key)}">open</button>
+        <button type="button" class="secondary" data-clone-name="${esc(s.name)}" data-clone-cwd="${esc(s.path || s.cwd || '')}" title="克隆：沿用此路径新建会话">克隆</button>
         ${s.live
           ? `<button type="button" class="danger" data-stop="${esc(s.name)}">停止</button>`
           : `<button type="button" class="danger" data-del="${esc(key)}">删除</button>`}
@@ -542,6 +711,12 @@ function renderList() {
   wrap.querySelectorAll('[data-rename]').forEach(btn => {
     btn.onclick = () => openRenameModal(btn.getAttribute('data-rename') || '');
   });
+  wrap.querySelectorAll('[data-clone-name]').forEach(btn => {
+    btn.onclick = () => openCloneModal(btn.getAttribute('data-clone-name') || '', btn.getAttribute('data-clone-cwd') || '');
+  });
+  wrap.querySelectorAll('[data-pages]').forEach(btn => {
+    btn.onclick = () => openPagesModal(parseRowKey(btn.getAttribute('data-pages')));
+  });
   wrap.querySelectorAll('[data-stop]').forEach(btn => {
     btn.onclick = async () => {
       const name = btn.getAttribute('data-stop');
@@ -569,7 +744,25 @@ function renderList() {
 }
 
 function paint() {
+  const gbtn = document.getElementById('btnDefaultPages');
+  if (gbtn) gbtn.textContent = '全局回看：' + defaultPages() + ' 页';
   renderList();
+}
+
+function renderLanBar() {
+  const el = document.getElementById('lanBar');
+  if (!el) return;
+  const lan = cache && cache.lan_ip;
+  const mport = location.port || (location.protocol === 'https:' ? '443' : '80');
+  if (!lan) { el.hidden = true; return; }
+  if (offTunnel()) {
+    // 已在局域网/本机直连：终端会以 http://<本机>:<ttyd端口> 打开，延迟更低
+    el.innerHTML = '局域网直连模式已启用 <span class="muted">· 打开终端将走本机地址，延迟更低</span>';
+  } else {
+    // 经公网隧道访问：提示同网设备可换用更快的局域网地址
+    el.innerHTML = '同一局域网内可改用更低延迟的地址访问本页：<code>http://' + esc(lan) + ':' + esc(mport) + '/</code>';
+  }
+  el.hidden = false;
 }
 
 async function refresh() {
@@ -579,6 +772,7 @@ async function refresh() {
   for (const k of [...rowSelected]) {
     if (!alive.has(k)) rowSelected.delete(k);
   }
+  renderLanBar();
   paint();
 }
 
@@ -613,6 +807,18 @@ function openRenameModal(oldName) {
   setTimeout(() => { input.focus(); input.select(); }, 50);
 }
 
+function openCloneModal(srcName, cwd) {
+  nameModalMode = { type: 'clone', cwd: cwd || '', srcName: srcName || '' };
+  document.getElementById('nameTitle').textContent = '克隆会话';
+  document.getElementById('nameHint').textContent = '沿用路径 ' + (cwd || '(默认)') + '，请输入新会话名';
+  document.getElementById('nameConfirm').textContent = '创建';
+  const modal = document.getElementById('nameModal');
+  const input = document.getElementById('nameInput');
+  modal.hidden = false;
+  input.value = '';
+  setTimeout(() => input.focus(), 50);
+}
+
 async function submitNameModal() {
   const name = (document.getElementById('nameInput').value || '').trim();
   if (!name) { flash('请输入会话名', true); return; }
@@ -642,7 +848,112 @@ async function submitNameModal() {
     return;
   }
   closeNameModal();
-  tryOpen({ name, create: true, cwd: cache.default_path || '' }, '');
+  const cwd = (mode && mode.type === 'clone') ? (mode.cwd || cache.default_path || '') : (cache.default_path || '');
+  tryOpen({ name, create: true, cwd }, '');
+}
+
+// { scope:'session', name, cwd, live } | { scope:'global' }
+let pagesModalTarget = null;
+
+function defaultPages() {
+  return Number(cache.default_pages) || 30;
+}
+
+function maxPages() {
+  return Number(cache.max_pages) || 2000;
+}
+
+function closePagesModal() {
+  pagesModalTarget = null;
+  document.getElementById('pagesModal').hidden = true;
+  document.getElementById('pagesInput').value = '';
+}
+
+function showPagesModal(input, cur) {
+  input.value = cur > 0 ? String(cur) : '';
+  document.getElementById('pagesModal').hidden = false;
+  setTimeout(() => { input.focus(); input.select(); }, 50);
+}
+
+function openPagesModal(meta) {
+  if (!meta || !meta.name) return;
+  const row = mergedRows().find(r => r.name === meta.name && (r.cwd || '') === (meta.cwd || '') && r.live === meta.live);
+  pagesModalTarget = { scope: 'session', name: meta.name, cwd: meta.cwd || '', live: meta.live };
+  document.getElementById('pagesTitle').textContent = '回看页数 · ' + meta.name;
+  document.getElementById('pagesHint').textContent =
+    '本会话滚轮回看的历史页数。留空 = 不单独配置，跟随全局默认（当前 ' + defaultPages() + ' 页）。';
+  document.getElementById('pagesInput').placeholder = '留空 = 跟随全局 ' + defaultPages();
+  const rst = document.getElementById('pagesReset');
+  rst.hidden = false;
+  rst.textContent = '跟随全局';
+  showPagesModal(document.getElementById('pagesInput'), row && row.pages > 0 ? row.pages : 0);
+}
+
+function openGlobalPagesModal() {
+  pagesModalTarget = { scope: 'global' };
+  const envDef = Number(cache.env_default_pages) || 30;
+  document.getElementById('pagesTitle').textContent = '全局默认回看页数';
+  document.getElementById('pagesHint').textContent =
+    '所有「未单独配置」的会话都用这个值（1~' + maxPages() + ' 页）。改完立即生效，下次打开终端起作用。';
+  document.getElementById('pagesInput').placeholder = '例如 ' + envDef;
+  const rst = document.getElementById('pagesReset');
+  rst.hidden = false;
+  rst.textContent = '恢复 ' + envDef;
+  showPagesModal(document.getElementById('pagesInput'), defaultPages());
+}
+
+async function savePages(pages) {
+  if (!pagesModalTarget) return;
+  const t = pagesModalTarget;
+  const btn = document.getElementById('pagesConfirm');
+  const rst = document.getElementById('pagesReset');
+  btn.disabled = true; rst.disabled = true;
+  try {
+    const body = t.scope === 'global'
+      ? { scope: 'global', pages }
+      : { scope: 'session', name: t.name, cwd: t.cwd, live: t.live, pages };
+    await api('/api/pages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    closePagesModal();
+    if (t.scope === 'global') {
+      flash('全局默认已设为 ' + pages + ' 页，未单独配置的会话下次进入生效');
+    } else if (pages === 0) {
+      flash('「' + t.name + '」已改为跟随全局默认');
+    } else {
+      flash('已设置「' + t.name + '」回看 ' + pages + ' 页，下次进入生效');
+    }
+    await refresh();
+  } catch (e) {
+    flash(String(e.message || e), true);
+  } finally {
+    btn.disabled = false; rst.disabled = false;
+  }
+}
+
+function resetPages() {
+  if (!pagesModalTarget) return;
+  // 会话级：0 = 清除配置跟随全局；全局级：回落 .env 里的初始默认
+  if (pagesModalTarget.scope === 'global') savePages(Number(cache.env_default_pages) || 30);
+  else savePages(0);
+}
+
+function submitPagesModal() {
+  if (!pagesModalTarget) return;
+  const raw = (document.getElementById('pagesInput').value || '').trim();
+  const isGlobal = pagesModalTarget.scope === 'global';
+  if (!raw) {
+    if (isGlobal) { flash('全局默认必须填写页数', true); return; }
+    savePages(0);   // 会话级留空 = 跟随全局
+    return;
+  }
+  if (!/^\d+$/.test(raw)) { flash('页数必须是正整数', true); return; }
+  const n = parseInt(raw, 10);
+  if (n < 1) { flash('页数至少 1；如需跟随全局请留空', true); return; }
+  if (n > maxPages()) { flash('页数最多 ' + maxPages(), true); return; }
+  savePages(n);
 }
 
 document.getElementById('searchQ').addEventListener('input', paint);
@@ -655,6 +966,17 @@ document.getElementById('nameInput').addEventListener('keydown', (ev) => {
 });
 document.getElementById('nameModal').addEventListener('click', (ev) => {
   if (ev.target.id === 'nameModal') closeNameModal();
+});
+document.getElementById('pagesCancel').onclick = closePagesModal;
+document.getElementById('pagesReset').onclick = resetPages;
+document.getElementById('btnDefaultPages').onclick = openGlobalPagesModal;
+document.getElementById('pagesConfirm').onclick = submitPagesModal;
+document.getElementById('pagesInput').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') submitPagesModal();
+  if (ev.key === 'Escape') closePagesModal();
+});
+document.getElementById('pagesModal').addEventListener('click', (ev) => {
+  if (ev.target.id === 'pagesModal') closePagesModal();
 });
 document.getElementById('btnBulkDel').onclick = async () => {
   const rows = selectedRows();
@@ -712,6 +1034,11 @@ def list_sessions() -> list[dict]:
         name, sid, created, last_open, clients = parts[:5]
         cwd = parts[5] if len(parts) > 5 else ""
         cwd_now = parts[6] if len(parts) > 6 else ""
+        pages_raw = parts[7] if len(parts) > 7 else ""
+        try:
+            pages = int(pages_raw)
+        except (TypeError, ValueError):
+            pages = 0
         sessions.append(
             {
                 "name": name,
@@ -721,6 +1048,7 @@ def list_sessions() -> list[dict]:
                 "clients": int(clients or 0),
                 "cwd": "" if cwd in ("", "-") else cwd,
                 "cwd_now": "" if cwd_now in ("", "-") else cwd_now,
+                "pages": pages,
             }
         )
     return sessions
@@ -781,8 +1109,39 @@ def rename_session(old_name: str, new_name: str) -> str:
     return (cp.stdout or "").strip()
 
 
+def set_session_pages(name: str, pages: int) -> None:
+    cp = run_ctl("set-pages", name, str(pages))
+    if cp.returncode != 0:
+        raise RuntimeError((cp.stderr or cp.stdout or "set-pages failed").strip())
+
+
+def set_history_pages(name: str, cwd: str, pages: int) -> None:
+    cp = run_ctl("history-set-pages", name, cwd or "", str(pages))
+    if cp.returncode != 0:
+        raise RuntimeError((cp.stderr or cp.stdout or "history-set-pages failed").strip())
+
+
+def session_pages(name: str) -> int:
+    """当前会话页数：优先运行中会话，其次历史记录；0 表示未设置(用全局默认)。"""
+    for s in list_sessions():
+        if s["name"] == name:
+            return int(s.get("pages") or 0)
+    for h in list_history(exclude_live=False):
+        if h.get("name") == name:
+            try:
+                return int(h.get("pages") or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
 def term_url(name: str, ticket: str) -> str:
-    return f"/term/?arg={quote(name, safe='')}&arg={quote(ticket, safe='')}"
+    url = f"/term/?arg={quote(name, safe='')}&arg={quote(ticket, safe='')}"
+    # 未单独配置的会话跟随全局默认；始终显式带上，改全局后下次打开即生效
+    pages = session_pages(name) or default_pages()
+    if pages > 0:
+        url += f"&pages={pages}"
+    return url
 
 
 def parse_cookies(header: str) -> dict[str, str]:
@@ -990,6 +1349,47 @@ class Handler(BaseHTTPRequestHandler):
             return True, []
         return False, []
 
+    def _lan_cors_headers(self) -> list[tuple[str, str]]:
+        """局域网直连时终端页在 ttyd 端口，粘贴图片是跨源请求。
+        仅当 Origin 恰为本机同主机的 ttyd 端口时放行，并允许携带 Cookie。"""
+        origin = self.headers.get("Origin", "")
+        if not origin:
+            return []
+        try:
+            u = urlparse(origin)
+        except ValueError:
+            return []
+        if u.scheme not in ("http", "https") or not u.hostname:
+            return []
+        if u.hostname in ("localhost", "127.0.0.1"):
+            return []  # 同机 loopback 不涉及跨端口场景，无需 CORS
+        want_port = str(u.port or "")
+        if want_port != str(TTYD_PORT):
+            return []
+        return [
+            ("Access-Control-Allow-Origin", origin),
+            ("Access-Control-Allow-Credentials", "true"),
+            ("Vary", "Origin"),
+        ]
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        cors = self._lan_cors_headers()
+        if path == "/api/paste-image" and cors:
+            self.send_response(204)
+            for k, v in cors:
+                self.send_header(k, v)
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         if not self._check_auth():
             return
@@ -1007,11 +1407,27 @@ class Handler(BaseHTTPRequestHandler):
                     "history": list_history(),
                     "path_root": PATH_ROOT,
                     "default_path": DEFAULT_PATH,
+                    "default_pages": default_pages(),
+                    "env_default_pages": _env_default_pages(),
+                    "max_pages": MAX_PAGES,
+                    "lan_ip": detect_lan_ip(),
+                    "ttyd_port": TTYD_PORT,
+                    "term_base": TTYD_BASE_PATH + "/",
+                    "public_host": PUBLIC_HOST,
                 },
             )
             return
         if path == "/api/health":
-            self._json(200, {"ok": True, "public": PUBLIC_HOST})
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "public": PUBLIC_HOST,
+                    "default_pages": default_pages(),
+                    "lan_ip": detect_lan_ip(),
+                    "ttyd_port": TTYD_PORT,
+                },
+            )
             return
         if path == "/api/unlock":
             self._json(200, {"ok": self._has_valid_unlock()})
@@ -1081,16 +1497,62 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "result": result})
             return
 
+        if path == "/api/pages":
+            scope = str(data.get("scope") or "session").strip()
+            try:
+                pages = int(data.get("pages"))
+            except (TypeError, ValueError):
+                self._json(400, {"error": "页数必须是整数"})
+                return
+
+            if scope == "global":
+                # 全局默认：必须是实数页，不能为 0（0 只在会话级表示“不配置”）
+                if pages < 1 or pages > MAX_PAGES:
+                    self._json(400, {"error": f"全局默认需在 1~{MAX_PAGES} 之间"})
+                    return
+                try:
+                    set_default_pages(pages)
+                except OSError as e:
+                    self._json(500, {"error": f"写入全局默认失败: {e}"})
+                    return
+                self._json(200, {"ok": True, "scope": "global", "default_pages": pages})
+                return
+
+            name = str(data.get("name") or "").strip()
+            cwd = str(data.get("cwd") or "").strip()
+            live = bool(data.get("live"))
+            if not NAME_RE.match(name):
+                self._json(400, {"error": "无效会话名"})
+                return
+            # 0 = 清除本会话配置，回落全局默认
+            if pages < 0 or pages > MAX_PAGES:
+                self._json(400, {"error": f"页数需在 0~{MAX_PAGES} 之间(0=用全局默认)"})
+                return
+            try:
+                if live:
+                    set_session_pages(name, pages)
+                else:
+                    set_history_pages(name, cwd, pages)
+            except RuntimeError as e:
+                self._json(400, {"error": str(e)})
+                return
+            self._json(
+                200,
+                {"ok": True, "pages": pages, "inherited": pages == 0, "default_pages": default_pages()},
+            )
+            return
+
         if path == "/api/paste-image":
+            cors = self._lan_cors_headers()
             mime = str(data.get("mime") or "image/png")
             b64 = str(data.get("image_base64") or "")
             if not b64:
-                self._json(400, {"error": "缺少 image_base64"})
+                self._json(400, {"error": "缺少 image_base64"}, cors)
                 return
             try:
                 img_raw = base64.b64decode(b64, validate=False)
             except Exception:
-                self._json(400, {"error": "base64 无效"})
+                self._json(400, {"error": "base64 无效"}, cors)
                 return
             # 默认写剪贴板；前端可传 set_clipboard=false 避免用坏图覆盖
             set_clip = data.get("set_clipboard", True)
@@ -1103,10 +1565,10 @@ class Handler(BaseHTTPRequestHandler):
                     img_raw, mime, set_clipboard=set_clip
                 )
             except ValueError as e:
-                self._json(400, {"error": str(e)})
+                self._json(400, {"error": str(e)}, cors)
                 return
             except RuntimeError as e:
-                self._json(500, {"error": str(e)})
+                self._json(500, {"error": str(e)}, cors)
                 return
             self._json(
                 200,
@@ -1118,6 +1580,7 @@ class Handler(BaseHTTPRequestHandler):
                     "height": height,
                     "bytes": len(img_raw),
                 },
+                cors,
             )
             return
 

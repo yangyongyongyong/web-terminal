@@ -13,12 +13,21 @@ PASTE_JS = ROOT / "web" / "wt-paste-image.js"
 
 
 def public_host() -> str:
+    return _env_val("PUBLIC_HOST", "term.lucadesign.uk")
+
+
+def manage_port() -> str:
+    return _env_val("MANAGE_PORT", "7690")
+
+
+def _env_val(key: str, default: str) -> str:
     env = ROOT / ".env"
     if env.exists():
         for line in env.read_text(encoding="utf-8").splitlines():
-            if line.startswith("PUBLIC_HOST="):
-                return line.split("=", 1)[1].strip() or "term.lucadesign.uk"
-    return "term.lucadesign.uk"
+            if line.startswith(f"{key}="):
+                val = line.split("=", 1)[1].strip().split("#", 1)[0].strip()
+                return val or default
+    return default
 
 
 def wheel_js_for_inject() -> str:
@@ -33,6 +42,9 @@ def paste_js_for_inject() -> str:
     raw = PASTE_JS.read_text(encoding="utf-8")
     if "hookPasteImage" not in raw or "paste-image" not in raw:
         raise SystemExit(f"{PASTE_JS} 缺少图片粘贴逻辑")
+    for need in ("hookKeys", "decideKeyAction", "decidePasteAction", "detectPlatform"):
+        if need not in raw:
+            raise SystemExit(f"{PASTE_JS} 缺少按系统分流的键位逻辑: {need}")
     return raw
 
 
@@ -58,14 +70,42 @@ INJECT_HEAD = r"""
 </style>
 <div id="wt-bar">
   <strong>web-terminal</strong>
-  <a href="https://__PUBLIC_HOST__/" target="_blank" rel="noopener">会话管理</a>
+  <a id="wt-manage-link" href="https://__PUBLIC_HOST__/" target="_blank" rel="noopener">会话管理</a>
   <span id="wt-session"></span>
   <span id="wt-status">连接中…</span>
-  <span id="wt-hint" style="color:#8b9aab">滚轮回看约30页 · Ctrl+V 可贴图</span>
+  <span id="wt-hint" style="color:#8b9aab">滚轮回看 · 支持粘贴图片</span>
 </div>
 <script id="wt-wheel">
 window.WT_SCROLLBACK_PAGES = __SCROLLBACK_PAGES__;
+(function () {
+  // 每会话页数：管理页在 open 时把 &pages=N 拼进 URL，优先于全局默认
+  try {
+    var p = new URLSearchParams(location.search).get('pages');
+    var n = p ? parseInt(p, 10) : 0;
+    if (n && n > 0) window.WT_SCROLLBACK_PAGES = n;
+  } catch (e) {}
+  try {
+    // 按键文案依赖客户端系统，等 WtPasteImage 载入后由 wt-reconnect 覆盖
+    var hint = document.getElementById('wt-hint');
+    if (hint) hint.textContent = '滚轮回看约' + window.WT_SCROLLBACK_PAGES + '页';
+  } catch (e) {}
+})();
 __WHEEL_JS__
+</script>
+<script id="wt-api-base">
+(function () {
+  // 终端页可能经隧道(同源)或局域网直连(页面在 ttyd 端口)加载。
+  // 同源→相对路径即可；局域网→图片粘贴等 API 必须打到管理端口。
+  try {
+    var pub = "__PUBLIC_HOST__";
+    var mport = "__MANAGE_PORT__";
+    if (location.hostname && location.hostname !== pub && mport) {
+      window.WT_API_BASE = location.protocol + '//' + location.hostname + ':' + mport;
+    } else {
+      window.WT_API_BASE = '';
+    }
+  } catch (e) { window.WT_API_BASE = ''; }
+})();
 </script>
 <script id="wt-paste-image">
 __PASTE_JS__
@@ -79,6 +119,20 @@ __PASTE_JS__
   var args = params.getAll('arg');
   var sessionName = args[0] || 'main';
   sessionEl.textContent = '会话: ' + sessionName;
+  // 局域网直连时，管理入口改指向本机地址（否则隧道域名在局域网内不可达/走公网）
+  try {
+    if (window.WT_API_BASE) {
+      var mlink = document.getElementById('wt-manage-link');
+      if (mlink) mlink.href = window.WT_API_BASE + '/';
+    }
+  } catch (e) {}
+  // 让 Chrome 标签页名 = 会话名，方便识别。shell 的 OSC 标题会不断改写它，故周期性钉回。
+  try {
+    document.title = sessionName;
+    setInterval(function () {
+      if (document.title !== sessionName) document.title = sessionName;
+    }, 1000);
+  } catch (e) {}
 
   var MAX_DELAY = 30000;
   var delay = 1000;
@@ -162,29 +216,55 @@ __PASTE_JS__
   window.WebSocket = WrappedWS;
 
   var hookTries = 0;
+  var keysHooked = false;
   var hookTimer = setInterval(function () {
     hookTries += 1;
     var ok = window.WtWheel && window.WtWheel.hookLocalWheel(function () { return window.term; });
-    if (ok || hookTries > 80) clearInterval(hookTimer);
+    // 键位改写（非 mac 客户端 Ctrl+V 贴文本 / Alt+V 贴图）必须挂在 term 上
+    if (!keysHooked && window.WtPasteImage && window.WtPasteImage.hookKeys) {
+      keysHooked = !!window.WtPasteImage.hookKeys(function () { return window.term; });
+    }
+    if ((ok && keysHooked) || hookTries > 80) clearInterval(hookTimer);
   }, 250);
 
   if (window.WtPasteImage && window.WtPasteImage.hookPasteImage) {
     window.WtPasteImage.hookPasteImage(function () { return window.term; });
   }
+
+  // 顶栏提示按客户端系统给出正确按键
+  try {
+    if (window.WtPasteImage && window.WtPasteImage.hintText) {
+      var hintEl = document.getElementById('wt-hint');
+      if (hintEl) hintEl.textContent = window.WtPasteImage.hintText(window.WT_SCROLLBACK_PAGES);
+    }
+  } catch (e) {}
 })();
 </script>
 """
 
 
-def build_inject() -> str:
-    pages = "30"
+def default_pages() -> str:
+    """全局默认回看页数：run/scrollback-pages(管理页可改) > .env SCROLLBACK_PAGES > 30。"""
+    rt = ROOT / "run" / "scrollback-pages"
+    if rt.exists():
+        raw = rt.read_text(encoding="utf-8").strip()
+        if raw.isdigit() and int(raw) >= 1:
+            return raw
     env = ROOT / ".env"
     if env.exists():
         for line in env.read_text(encoding="utf-8").splitlines():
             if line.startswith("SCROLLBACK_PAGES="):
-                pages = (line.split("=", 1)[1].strip() or "30").split("#", 1)[0].strip() or "30"
+                val = (line.split("=", 1)[1].strip() or "30").split("#", 1)[0].strip()
+                if val.isdigit() and int(val) >= 1:
+                    return val
                 break
+    return "30"
+
+
+def build_inject() -> str:
+    pages = default_pages()
     inject = INJECT_HEAD.replace("__PUBLIC_HOST__", public_host())
+    inject = inject.replace("__MANAGE_PORT__", manage_port())
     inject = inject.replace("__SCROLLBACK_PAGES__", pages)
     inject = inject.replace("__WHEEL_JS__", wheel_js_for_inject())
     return inject.replace("__PASTE_JS__", paste_js_for_inject())

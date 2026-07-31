@@ -88,8 +88,8 @@
     try {
       if (!term || !term.options) return;
       var want = scrollbackLines(term);
-      var cur = Number(term.options.scrollback) || 0;
-      if (cur < want) term.options.scrollback = want;
+      // 精确设值：每会话页数可调大也可调小，不再只升不降
+      if (Number(term.options.scrollback) !== want) term.options.scrollback = want;
       term.options.smoothScrollDuration = 0;
     } catch (e) {}
   }

@@ -30,7 +30,15 @@ set +a
 : "${SESSION_PATH_ROOT:=${HOME}}"
 : "${SESSION_DEFAULT_PATH:=${HOME}}"
 # 浏览器端保留约 N 页滚动历史（滚轮本地回看）；按 50 行/页估算
+# .env 里的值是初始默认；管理页改过全局默认后以 run/scrollback-pages 为准
 : "${SCROLLBACK_PAGES:=30}"
+if [[ -f "${ROOT}/run/scrollback-pages" ]]; then
+  _wt_pages="$(head -c 8 "${ROOT}/run/scrollback-pages" | tr -dc '0-9')"
+  if [[ -n "${_wt_pages}" && "${_wt_pages}" -ge 1 ]]; then
+    SCROLLBACK_PAGES="${_wt_pages}"
+  fi
+  unset _wt_pages
+fi
 
 # 注意：不要 export 名为 TUNNEL_* 的变量，会干扰 cloudflared
 export ROOT ENV_FILE TTYD_USER TTYD_PASSWORD TTYD_HOST TTYD_PORT TMUX_SESSION PUBLIC_HOST USE_TMUX LOGIN_SHELL

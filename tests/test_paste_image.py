@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import struct
+import subprocess
 import sys
 import tempfile
 import zlib
@@ -99,6 +100,14 @@ def main() -> None:
         "pickLargestImage",
         "set_clipboard",
         "MIN_PIXELS",
+        # 按客户端系统分流键位
+        "hookKeys",
+        "detectPlatform",
+        "decideKeyAction",
+        "decidePasteAction",
+        "attachCustomKeyEventHandler",
+        "navigator.clipboard",
+        "wt-paste-overlay",
     ):
         if key not in paste_js:
             fail(f"前端缺少 {key}")
@@ -106,5 +115,79 @@ def main() -> None:
     print("OK: paste-image 落盘与前端脚本")
 
 
+def test_key_policy_node() -> None:
+    """按系统分流的键位/粘贴决策单测：mac 不受影响，Windows 才改键。"""
+    script = r"""
+const m = require('./web/wt-paste-image.js');
+const assert = (c, msg) => { if (!c) { console.error('ASSERT ' + msg); process.exit(1); } };
+const kd = (o) => Object.assign({ type: 'keydown', code: 'KeyV' }, o);
+
+// mac 客户端：任何组合都不拦截（⌘V 走原生 paste，Ctrl+V 由 xterm 透传 ）
+assert(m.decideKeyAction(kd({ ctrlKey: true }), 'mac') === 'default', 'mac ctrl+v default');
+assert(m.decideKeyAction(kd({ altKey: true }), 'mac') === 'default', 'mac alt+v default');
+assert(m.decideKeyAction(kd({ metaKey: true }), 'mac') === 'default', 'mac cmd+v default');
+
+// 非 mac：Ctrl+V 走浏览器原生粘贴，Alt+V 贴图，Ctrl+Alt+V 发原始 ^V
+assert(m.decideKeyAction(kd({ ctrlKey: true }), 'other') === 'native-paste', 'win ctrl+v');
+assert(m.decideKeyAction(kd({ altKey: true }), 'other') === 'image-paste', 'win alt+v');
+assert(m.decideKeyAction(kd({ ctrlKey: true, altKey: true }), 'other') === 'raw-ctrl-v', 'win ctrl+alt+v');
+assert(m.decideKeyAction(kd({ ctrlKey: true, shiftKey: true }), 'other') === 'default', 'win ctrl+shift+v 不拦截');
+assert(m.decideKeyAction(kd({ metaKey: true }), 'other') === 'default', 'win meta+v 不拦截');
+assert(m.decideKeyAction(kd({}), 'other') === 'default', '裸 v 不拦截');
+assert(m.decideKeyAction(kd({ ctrlKey: true, code: 'KeyC' }), 'other') === 'default', 'ctrl+c 不拦截');
+assert(m.decideKeyAction(kd({ ctrlKey: true, type: 'keyup' }), 'other') === 'default', 'keyup 不处理');
+assert(m.decideKeyAction(kd({ ctrlKey: true, code: undefined, keyCode: 86 }), 'other') === 'native-paste', 'keyCode 兜底');
+assert(m.decideKeyAction(kd({ ctrlKey: true, code: undefined, key: 'V' }), 'other') === 'native-paste', 'key 兜底');
+
+// paste 事件决策
+assert(m.decidePasteAction({ platform: 'mac', hasImage: true, hasText: true }) === 'image', 'mac 图优先');
+assert(m.decidePasteAction({ platform: 'other', hasImage: true, hasText: true }) === 'text', 'win 文本优先');
+assert(m.decidePasteAction({ platform: 'other', hasImage: true, hasText: false }) === 'image', 'win 只有图则贴图');
+assert(m.decidePasteAction({ platform: 'other', hasImage: false, hasText: true }) === 'text', '无图必文本');
+assert(m.decidePasteAction({ platform: 'mac', hasImage: false, hasText: false }) === 'text', '无图必文本(mac)');
+assert(m.decidePasteAction({ platform: 'other', hasImage: true, hasText: true, forceImage: true }) === 'image', '浮层强制贴图');
+
+// 平台识别
+assert(m.detectPlatform({ platform: 'MacIntel', userAgent: 'Mozilla/5.0 (Macintosh)' }) === 'mac', 'MacIntel');
+assert(m.detectPlatform({ platform: 'Win32', userAgent: 'Mozilla/5.0 (Windows NT 10.0)' }) === 'other', 'Win32');
+assert(m.detectPlatform({ platform: 'Linux x86_64', userAgent: 'Mozilla/5.0 (X11; Linux)' }) === 'other', 'Linux');
+assert(m.detectPlatform({ platform: '', userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0)' }) === 'mac', 'iPad UA');
+assert(m.detectPlatform({ userAgentData: { platform: 'Windows' }, platform: 'MacIntel' }) === 'other', 'userAgentData 优先');
+
+// 上传选项：只有 mac 的原生粘贴才信任本机剪贴板
+assert(m.uploadOptsFor('mac', false).preferNativeClipboard === true, 'mac 保护剪贴板');
+assert(m.uploadOptsFor('other', false).forceClipboard === true, 'win 必须写 mac 剪贴板');
+assert(m.uploadOptsFor('mac', true).forceClipboard === true, '强制模式写剪贴板');
+
+// 顶栏文案
+assert(m.hintText(60, 'mac').indexOf('⌘V') >= 0, 'mac 文案');
+assert(m.hintText(60, 'other').indexOf('Alt+V') >= 0, 'win 文案');
+assert(m.hintText(60, 'other').indexOf('贴文本') >= 0, 'win 文案含贴文本');
+
+console.log('node key policy ok');
+"""
+    cp = subprocess.run(["node", "-e", script], cwd=str(ROOT), capture_output=True, text=True)
+    if cp.returncode != 0:
+        fail(f"node 键位单测失败: {cp.stderr or cp.stdout}")
+    print("OK: 按系统分流的键位决策单测")
+
+
+def test_index_inject_keys() -> None:
+    """注入页必须挂上键位钩子，且不再硬编码 mac-only 的提示。"""
+    patch = ROOT / "bin" / "patch-ttyd-index.py"
+    cp = subprocess.run([sys.executable, str(patch)], cwd=str(ROOT), capture_output=True, text=True)
+    if cp.returncode != 0:
+        fail(f"patch-ttyd-index 失败: {cp.stderr or cp.stdout}")
+    html = (ROOT / "web" / "ttyd-index.html").read_text(encoding="utf-8")
+    for needle in ("WtPasteImage.hookKeys", "WtPasteImage.hintText", "decideKeyAction", "wt-paste-overlay"):
+        if needle not in html:
+            fail(f"ttyd-index.html 缺少注入: {needle}")
+    if "Ctrl+V 可贴图" in html.split("<script", 1)[0]:
+        fail("顶栏静态文案仍写死 mac-only 的 Ctrl+V 贴图")
+    print("OK: ttyd-index 已注入键位钩子")
+
+
 if __name__ == "__main__":
     main()
+    test_key_policy_node()
+    test_index_inject_keys()
