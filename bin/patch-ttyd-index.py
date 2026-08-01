@@ -10,6 +10,24 @@ STOCK = ROOT / "web" / "ttyd-stock.html"
 OUT = ROOT / "web" / "ttyd-index.html"
 WHEEL_JS = ROOT / "web" / "wt-wheel.js"
 PASTE_JS = ROOT / "web" / "wt-paste-image.js"
+ICON_SVG = ROOT / "web" / "wt-icon-term.svg"
+ICON_PNG = ROOT / "web" / "wt-icon-term-64.png"
+
+
+def favicon_links() -> str:
+    """ttyd 自带的 favicon 是黑底黑字，在深色标签栏里等于没有图标；换成高对比图标。
+
+    走 data URI：终端页可能经隧道或局域网 ttyd 端口加载，省掉额外路由与跨源问题。
+    """
+    import base64
+
+    svg = base64.b64encode(ICON_SVG.read_bytes()).decode()
+    png = base64.b64encode(ICON_PNG.read_bytes()).decode()
+    return (
+        f'<link id="wt-favicon" rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,{svg}">'
+        f'<link rel="alternate icon" type="image/png" sizes="64x64" href="data:image/png;base64,{png}">'
+        f'<link rel="apple-touch-icon" href="data:image/png;base64,{png}">'
+    )
 
 
 def public_host() -> str:
@@ -280,6 +298,10 @@ def main() -> int:
     if not PASTE_JS.exists():
         print(f"缺少 {PASTE_JS}", file=sys.stderr)
         return 1
+    for icon in (ICON_SVG, ICON_PNG):
+        if not icon.exists():
+            print(f"缺少 {icon}", file=sys.stderr)
+            return 1
     html = STOCK.read_text(encoding="utf-8")
     if 'id="wt-reconnect"' in html:
         print(f"{STOCK} 已是注入版，请删除后重新抓取 stock", file=sys.stderr)
@@ -287,7 +309,19 @@ def main() -> int:
     if "</body>" not in html:
         print("stock HTML 无 </body>", file=sys.stderr)
         return 1
-    patched = html.replace("</body>", build_inject() + "</body>", 1)
+    # 替换 ttyd 默认 favicon（黑底黑字，深色标签栏里看不见）
+    import re
+
+    patched, n = re.subn(
+        r'<link rel="icon" type="image/png" href="data:image/png;base64,[^"]+"\s*/?>',
+        favicon_links(),
+        html,
+        count=1,
+    )
+    if n != 1:
+        if "wt-favicon" not in patched:
+            patched = patched.replace("</title>", "</title>" + favicon_links(), 1)
+    patched = patched.replace("</body>", build_inject() + "</body>", 1)
     OUT.write_text(patched, encoding="utf-8")
     print(f"已写入 {OUT} ({OUT.stat().st_size} bytes)")
     return 0

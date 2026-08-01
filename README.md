@@ -15,6 +15,7 @@
 - **会话管理**：首页可查看当前会话、历史（已停止）、新建 / 打开 / 停止
 - **进入 PIN**：打开/新建终端需输入 `.env` 的 `SESSION_PIN`（与 Basic Auth 分离；界面不提示规则）
 - **工作目录**：新建时可指定路径，且必须在 `SESSION_PATH_ROOT` 下；管理页支持按名称/路径关键字检索
+- **标签页图标**：终端页（绿）/ 管理页（蓝）各有高对比 favicon —— ttyd 自带图标是黑底黑字，深色标签栏里等于没图标
 - **粘贴图片**：按客户端系统分流键位 —— macOS 客户端 `⌘V`/`Ctrl+V` 贴图（沿用本机剪贴板）；Windows/Linux 客户端 `Ctrl+V` 贴文本、`Alt+V` 贴图（剪贴板 API 不可用时弹引导浮层）、`Ctrl+Alt+V` 发原始 `^V` 给 vim 等
 - **回看页数**：管理页「全局回看」设全局默认（存 `run/scrollback-pages`，即时生效）；每个会话可单独配置，留空/点「跟随全局」即不配置、自动跟随全局默认
 
@@ -57,7 +58,7 @@ web-terminal/
 │   ├── cloudflared.yml
 │   ├── tmux.web.conf
 │   └── uk.lucadesign.web-terminal.*.plist
-├── web/                 # ttyd 自定义页（启动时生成）
+├── web/                 # ttyd 自定义页（启动时生成）+ wt-*.js / wt-icon-*（favicon 源）
 ├── logs/
 └── run/
 ```

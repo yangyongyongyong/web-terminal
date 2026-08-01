@@ -157,6 +157,24 @@ def set_default_pages(pages: int) -> None:
     tmp = PAGES_FILE.with_suffix(".tmp")
     tmp.write_text(f"{int(pages)}\n", encoding="utf-8")
     tmp.replace(PAGES_FILE)
+ICON_SVG = ROOT / "web" / "wt-icon-manage.svg"
+ICON_PNG = ROOT / "web" / "wt-icon-manage-64.png"
+
+
+def favicon_links() -> str:
+    """管理页原本没有 favicon（标签栏空白）。用 data URI 内联，避免额外请求与鉴权往返。"""
+    try:
+        svg = base64.b64encode(ICON_SVG.read_bytes()).decode()
+        png = base64.b64encode(ICON_PNG.read_bytes()).decode()
+    except OSError:
+        return ""
+    return (
+        f'<link id="wt-favicon" rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,{svg}">'
+        f'<link rel="alternate icon" type="image/png" sizes="64x64" href="data:image/png;base64,{png}">'
+        f'<link rel="apple-touch-icon" href="data:image/png;base64,{png}">'
+    )
+
+
 PASTE_DIR = ROOT / "run" / "paste-images"
 PASTE_MAX_BYTES = 12 * 1024 * 1024
 PASTE_MIME_EXT = {
@@ -173,6 +191,7 @@ MANAGE_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Web Terminal · 会话管理</title>
+__FAVICON__
 <style>
   :root {
     --bg: #0f1419; --panel: #1a222c; --line: #2a3542;
@@ -1013,6 +1032,8 @@ setInterval(() => { refresh().catch(() => {}); }, 8000);
 </html>
 """
 
+MANAGE_HTML = MANAGE_HTML.replace("__FAVICON__", favicon_links(), 1)
+
 
 def run_ctl(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -1325,6 +1346,10 @@ class Handler(BaseHTTPRequestHandler):
         body = html.encode("utf-8")
         self._send(code, body, "text/html; charset=utf-8")
 
+    def _binary(self, code: int, body: bytes, ctype: str) -> None:
+        # 图标可长缓存：内容随发布变化时页面里的 data URI 才是主路径
+        self._send(code, body, ctype, [("Cache-Control", "public, max-age=86400")])
+
     def _unlock_cookie_header(self) -> str:
         token, max_age = session_ticket.issue_unlock(ENV)
         # 不强制 Secure：本机 http://127.0.0.1 也可用；公网 HTTPS 下 SameSite=Lax 足够
@@ -1416,6 +1441,18 @@ class Handler(BaseHTTPRequestHandler):
                     "public_host": PUBLIC_HOST,
                 },
             )
+            return
+        if path in ("/favicon.ico", "/icon.png"):
+            try:
+                self._binary(200, ICON_PNG.read_bytes(), "image/png")
+            except OSError:
+                self._json(404, {"error": "no icon"})
+            return
+        if path == "/icon.svg":
+            try:
+                self._binary(200, ICON_SVG.read_bytes(), "image/svg+xml")
+            except OSError:
+                self._json(404, {"error": "no icon"})
             return
         if path == "/api/health":
             self._json(
