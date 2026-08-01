@@ -23,6 +23,7 @@
   var TOAST_MS = 1200;
   var TOAST_ID = "wt-copy-toast";
   var lastText = "";
+  var suppressedUntil = 0; // 搜索等功能用 term.select 高亮时临时抑制自动复制
   var lastPointer = null;
   var toastTimer = null;
   var statusTimer = null;
@@ -36,6 +37,7 @@
     if (!ctx.hasSelection) return "skip";
     var text = String(ctx.text == null ? "" : ctx.text);
     if (!text.replace(/\s+/g, "").length) return "skip"; // 纯空白：多半是误拖
+    if (ctx.suppressed) return "skip"; // 程序化选中（如搜索高亮）不该进剪贴板
     if (ctx.lastText && text === ctx.lastText) return "skip"; // 同一段选中不重复复制
     if (text.length > (ctx.maxChars || MAX_CHARS)) return "too-big";
     return "copy";
@@ -177,7 +179,12 @@
       text = "";
     }
     var hasSelection = typeof term.hasSelection === "function" ? !!term.hasSelection() : !!text;
-    var action = decideCopyAction({ hasSelection: hasSelection, text: text, lastText: lastText });
+    var action = decideCopyAction({
+      hasSelection: hasSelection,
+      text: text,
+      lastText: lastText,
+      suppressed: Date.now() < suppressedUntil,
+    });
     if (action === "skip") {
       if (!hasSelection) lastText = ""; // 选中被清空：允许再次复制同样内容
       return { ok: false, action: "skip" };
@@ -245,7 +252,13 @@
     return true;
   }
 
+  /** 之后 ms 毫秒内的选中不自动复制（搜索高亮期间用） */
+  function suppress(ms) {
+    suppressedUntil = Date.now() + (Number(ms) || 500);
+  }
+
   function resetForTest() {
+    suppressedUntil = 0;
     lastText = "";
     lastPointer = null;
     if (statusTimer) clearTimeout(statusTimer);
@@ -263,6 +276,7 @@
     legacyCopy: legacyCopy,
     manualCopyHint: manualCopyHint,
     manualCopyKey: manualCopyKey,
+    suppress: suppress,
     MAX_CHARS: MAX_CHARS,
     resetForTest: resetForTest,
     TOAST_ID: TOAST_ID,

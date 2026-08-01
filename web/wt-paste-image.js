@@ -94,8 +94,8 @@
   function hintText(pages, platform) {
     var n = Number(pages) || 30;
     var p = platform || detectPlatform();
-    if (p === "mac") return "滚轮回看约" + n + "页 · ⌘V/Ctrl+V 可贴图 · 选中即复制";
-    return "滚轮回看约" + n + "页 · Ctrl+V 贴文本 · Alt+V 贴图 · 选中即复制";
+    if (p === "mac") return "滚轮回看约" + n + "页 · ⌘V/Ctrl+V 贴图 · 选中即复制 · ⌘F 搜索";
+    return "滚轮回看约" + n + "页 · Ctrl+V 贴文本 · Alt+V 贴图 · 选中即复制 · Ctrl+F 搜索";
   }
 
   /**
@@ -496,6 +496,9 @@
     document.addEventListener(
       "paste",
       function (ev) {
+        // 往普通输入框（如搜索框）里粘贴：完全交给浏览器
+        var tgt = ev.target;
+        if (!isOverlayOpen() && tgt && tgt.tagName === "INPUT") return;
         var forceImage = isOverlayOpen() || Date.now() < forceImageUntil;
         var img = pickLargestImage(ev.clipboardData);
         var platform = detectPlatform();

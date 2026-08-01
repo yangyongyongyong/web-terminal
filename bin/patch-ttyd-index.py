@@ -11,6 +11,7 @@ OUT = ROOT / "web" / "ttyd-index.html"
 WHEEL_JS = ROOT / "web" / "wt-wheel.js"
 PASTE_JS = ROOT / "web" / "wt-paste-image.js"
 COPY_JS = ROOT / "web" / "wt-copy.js"
+SEARCH_JS = ROOT / "web" / "wt-search.js"
 ICON_SVG = ROOT / "web" / "wt-icon-term.svg"
 ICON_PNG = ROOT / "web" / "wt-icon-term-64.png"
 
@@ -72,6 +73,14 @@ def copy_js_for_inject() -> str:
     for need in ("hookCopyOnSelect", "decideCopyAction", "copyText"):
         if need not in raw:
             raise SystemExit(f"{COPY_JS} 缺少选中即复制逻辑: {need}")
+    return raw
+
+
+def search_js_for_inject() -> str:
+    raw = SEARCH_JS.read_text(encoding="utf-8")
+    for need in ("hookSearch", "decideSearchKeyAction", "findMatches", "registerDecoration"):
+        if need not in raw:
+            raise SystemExit(f"{SEARCH_JS} 缺少搜索逻辑: {need}")
     return raw
 
 
@@ -139,6 +148,9 @@ __PASTE_JS__
 </script>
 <script id="wt-copy">
 __COPY_JS__
+</script>
+<script id="wt-search">
+__SEARCH_JS__
 </script>
 <script id="wt-reconnect">
 (function () {
@@ -248,6 +260,7 @@ __COPY_JS__
   var hookTries = 0;
   var keysHooked = false;
   var copyHooked = false;
+  var searchHooked = false;
   var hookTimer = setInterval(function () {
     hookTries += 1;
     var ok = window.WtWheel && window.WtWheel.hookLocalWheel(function () { return window.term; });
@@ -259,7 +272,11 @@ __COPY_JS__
     if (!copyHooked && window.WtCopy && window.WtCopy.hookCopyOnSelect) {
       copyHooked = !!window.WtCopy.hookCopyOnSelect(function () { return window.term; });
     }
-    if ((ok && keysHooked && copyHooked) || hookTries > 80) clearInterval(hookTimer);
+    // 搜索：⌘F / Ctrl+F，document 捕获阶段处理，不占用 xterm 的自定义键处理器
+    if (!searchHooked && window.WtSearch && window.WtSearch.hookSearch) {
+      searchHooked = !!window.WtSearch.hookSearch(function () { return window.term; });
+    }
+    if ((ok && keysHooked && copyHooked && searchHooked) || hookTries > 80) clearInterval(hookTimer);
   }, 250);
 
   if (window.WtPasteImage && window.WtPasteImage.hookPasteImage) {
@@ -303,7 +320,8 @@ def build_inject() -> str:
     inject = inject.replace("__SCROLLBACK_PAGES__", pages)
     inject = inject.replace("__WHEEL_JS__", wheel_js_for_inject())
     inject = inject.replace("__PASTE_JS__", paste_js_for_inject())
-    return inject.replace("__COPY_JS__", copy_js_for_inject())
+    inject = inject.replace("__COPY_JS__", copy_js_for_inject())
+    return inject.replace("__SEARCH_JS__", search_js_for_inject())
 
 
 def main() -> int:
@@ -318,6 +336,9 @@ def main() -> int:
         return 1
     if not COPY_JS.exists():
         print(f"缺少 {COPY_JS}", file=sys.stderr)
+        return 1
+    if not SEARCH_JS.exists():
+        print(f"缺少 {SEARCH_JS}", file=sys.stderr)
         return 1
     for icon in (ICON_SVG, ICON_PNG):
         if not icon.exists():

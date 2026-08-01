@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>wt search harness</title></head>
+<body><div id="wt-status">已连接</div><div id="wt-hint"></div>
+<script src="../../web/wt-search.js"></script>
+<script>
+// 由 tests/browser-keys.mjs（同一 CDP 驱动）调 window.__run() 收集结果
+const R = [], note = (k, v) => R.push(k + '=' + v);
+const tick = (ms) => new Promise(r => setTimeout(r, ms || 30));
+const $ = (id) => document.getElementById(id);
+
+// 假 term：够用地实现 xterm 的 buffer / 装饰 / 选中 API
+// 每行用 cell 数组描述，可表达宽字符（width 2 + 紧跟一个 width 0 的占位格）
+function cell(chars, width) { return { getChars: () => chars, getWidth: () => (width === undefined ? 1 : width) }; }
+function asciiCells(s) { return s.split('').map(ch => cell(ch, 1)); }
+function makeLine(cells, wrapped) {
+  return {
+    isWrapped: !!wrapped,
+    length: cells.length,
+    getCell: (x) => cells[x],
+    translateToString: (trim) => {
+      const s = cells.map(c => (c.getWidth() === 0 ? '' : (c.getChars() || ' '))).join('');
+      return trim ? s.replace(/\s+$/, '') : s;
+    },
+  };
+}
+function makeTerm(lines) {
+  const t = {
+    rows: 10, cols: 40,
+    selects: [], scrolls: [], cleared: 0, focused: 0,
+    decorations: [], markers: [], disposedDecorations: 0,
+  };
+  t.buffer = { active: {
+    length: lines.length, baseY: 0, cursorY: 0, viewportY: 0,
+    getLine: (y) => lines[y],
+  } };
+  t.select = (col, row, len) => t.selects.push([col, row, len]);
+  t.clearSelection = () => { t.cleared += 1; };
+  t.getSelection = () => t._sel || '';
+  t.scrollToLine = (y) => t.scrolls.push(y);
+  t.focus = () => { t.focused += 1; };
+  t.registerMarker = (offset) => { const m = { offset, dispose() {} }; t.markers.push(m); return m; };
+  t.registerDecoration = (opts) => {
+    const d = { opts, dispose: () => { t.disposedDecorations += 1; } };
+    t.decorations.push(d); return d;
+  };
+  return t;
+}
+function setPlatform(plat) {
+  Object.defineProperty(navigator, 'userAgentData', { value: undefined, configurable: true });
+  Object.defineProperty(navigator, 'platform', { value: plat, configurable: true });
+}
+function keydown(target, init) {
+  const ev = new KeyboardEvent('keydown', Object.assign({ bubbles: true, cancelable: true }, init));
+  target.dispatchEvent(ev);
+  return ev;
+}
+
+// 抑制「选中即复制」的调用记录
+const suppressCalls = [];
+window.WtCopy = { suppress: (ms) => suppressCalls.push(ms) };
+
+window.__run = async () => {
+  try {
+    // ---------- 纯函数：折行合并 + 命中查找 + 宽字符列号 ----------
+    const wrapped = [
+      makeLine(asciiCells('abc nee'), false),
+      makeLine(asciiCells('dle xyz'), true),        // 折行：needle 被切成两半
+    ];
+    const wt = makeTerm(wrapped);
+    const logic = WtSearch.collectLogicalLines(wt);
+    note('logicalLines', logic.length + ' text:' + JSON.stringify(logic[0].text));
+    note('wrappedMatch', JSON.stringify(WtSearch.findMatches(logic, 'needle')));
+
+    const cjk = [makeLine([...asciiCells('a'), cell('中', 2), cell('', 0), ...asciiCells('needle')], false)];
+    const ct = makeTerm(cjk);
+    const cjkLogic = WtSearch.collectLogicalLines(ct);
+    const cjkHit = WtSearch.findMatches(cjkLogic, 'needle')[0];
+    note('cjkIndex', cjkHit.index);
+    note('cjkCell', JSON.stringify(WtSearch.locateCell(ct, cjkLogic[0], cjkHit.index)));
+
+    // ---------- 挂钩子 + 键位 ----------
+    const lines = [
+      makeLine(asciiCells('alpha needle beta'), false),
+      makeLine(asciiCells('nothing here'), false),
+      makeLine(asciiCells('needle again needle'), false),
+    ];
+    const term = makeTerm(lines);
+    note('hook', WtSearch.hookSearch(() => term));
+    note('hookIdempotent', WtSearch.hookSearch(() => term));
+
+    // Windows：Ctrl+F 开，⌘F 不开
+    setPlatform('Win32');
+    let ev = keydown(document, { key: 'f', code: 'KeyF', keyCode: 70, metaKey: true });
+    note('winCmdF', 'prevented:' + ev.defaultPrevented + ' open:' + WtSearch.stateForTest().open);
+    ev = keydown(document, { key: 'f', code: 'KeyF', keyCode: 70, ctrlKey: true });
+    await tick(60);
+    note('winCtrlF', 'prevented:' + ev.defaultPrevented + ' open:' + WtSearch.stateForTest().open +
+      ' visible:' + ($(WtSearch.BAR_ID).style.display !== 'none') + ' focused:' + (document.activeElement === $(WtSearch.INPUT_ID)));
+
+    // 输入关键词 → 命中数 / 装饰 / 当前命中选中 + 抑制自动复制
+    const input = $(WtSearch.INPUT_ID);
+    input.value = 'needle';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await tick(WtSearch.DEBOUNCE_MS + 150);
+    note('search', 'total:' + WtSearch.stateForTest().total + ' count:' + $(WtSearch.COUNT_ID).textContent +
+      ' decorations:' + term.decorations.length + ' select:' + JSON.stringify(term.selects[term.selects.length - 1]));
+    note('suppressCalled', suppressCalls.length > 0);
+    note('currentDecorationColor', term.decorations.filter(d => d.opts.backgroundColor === '#f5a524').length);
+
+    // 回车循环（当前在最后一个 3/3 → 下一个回到 1/3）
+    keydown(input, { key: 'Enter', keyCode: 13 });
+    await tick(80);
+    note('next', $(WtSearch.COUNT_ID).textContent);
+    keydown(input, { key: 'Enter', keyCode: 13, shiftKey: true });
+    await tick(80);
+    note('prev', $(WtSearch.COUNT_ID).textContent);
+
+    // 终端外按回车不该被拦（不影响正常输入）
+    ev = keydown(document.body, { key: 'Enter', keyCode: 13 });
+    note('enterOutsideBar', 'prevented:' + ev.defaultPrevented);
+
+    // 无匹配
+    input.value = 'zzz'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    await tick(WtSearch.DEBOUNCE_MS + 150);
+    note('noMatch', $(WtSearch.COUNT_ID).textContent + ' decorations:' + WtSearch.stateForTest().decorations + ' cleared:' + (term.cleared > 0));
+
+    // Esc 关闭：清装饰、焦点回终端
+    ev = keydown(input, { key: 'Escape', keyCode: 27 });
+    await tick(80);
+    note('escape', 'prevented:' + ev.defaultPrevented + ' open:' + WtSearch.stateForTest().open +
+      ' hidden:' + ($(WtSearch.BAR_ID).style.display === 'none') + ' termFocused:' + (term.focused > 0));
+
+    // mac：⌘F 开，Ctrl+F 留给 PTY（readline 前移光标）
+    setPlatform('MacIntel');
+    ev = keydown(document, { key: 'f', code: 'KeyF', keyCode: 70, ctrlKey: true });
+    note('macCtrlF', 'prevented:' + ev.defaultPrevented + ' open:' + WtSearch.stateForTest().open);
+    ev = keydown(document, { key: 'f', code: 'KeyF', keyCode: 70, metaKey: true });
+    await tick(60);
+    note('macCmdF', 'prevented:' + ev.defaultPrevented + ' open:' + WtSearch.stateForTest().open);
+
+    // 打开时带上终端里已选中的文字作为关键词
+    WtSearch.closeSearch(() => term);
+    term._sel = 'again';
+    WtSearch.openSearch(() => term);
+    await tick(60);
+    note('seedFromSelection', $(WtSearch.INPUT_ID).value + ' count:' + $(WtSearch.COUNT_ID).textContent);
+    WtSearch.closeSearch(() => term);
+  } catch (err) {
+    note('ERR', String((err && err.stack) || err).slice(0, 300));
+  }
+  return R;
+};
+</script></body></html>
