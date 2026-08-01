@@ -15,6 +15,7 @@
 - **会话管理**：首页可查看当前会话、历史（已停止）、新建 / 打开 / 停止
 - **进入 PIN**：打开/新建终端需输入 `.env` 的 `SESSION_PIN`（与 Basic Auth 分离；界面不提示规则）
 - **工作目录**：新建时可指定路径，且必须在 `SESSION_PATH_ROOT` 下；管理页支持按名称/路径关键字检索
+- **选中即复制**：终端里鼠标选中文本立刻写入客户端剪贴板，并在鼠标旁浮出「已复制 N 字」；应用开了鼠标上报（Claude Code 等 TUI）时用 `Option+拖选`（mac）/ `Shift+拖选`（Windows/Linux）
 - **标签页图标**：终端页（绿）/ 管理页（蓝）各有高对比 favicon —— ttyd 自带图标是黑底黑字，深色标签栏里等于没图标
 - **粘贴图片**：按客户端系统分流键位 —— macOS 客户端 `⌘V`/`Ctrl+V` 贴图（沿用本机剪贴板）；Windows/Linux 客户端 `Ctrl+V` 贴文本、`Alt+V` 贴图（剪贴板 API 不可用时弹引导浮层）、`Ctrl+Alt+V` 发原始 `^V` 给 vim 等
 - **回看页数**：管理页「全局回看」设全局默认（存 `run/scrollback-pages`，即时生效）；每个会话可单独配置，留空/点「跟随全局」即不配置、自动跟随全局默认
@@ -84,6 +85,7 @@ web-terminal/
 ## 说明
 
 - 默认会话名 `main`；URL 形如 `/term/?arg=work` 或新建 `/term/?arg=work&arg=create`
+- 复制链路：优先 `navigator.clipboard.writeText`（HTTPS/本机），局域网明文 http 下退回 `execCommand('copy')`；超过 10 万字符（如 ⌘A 全选回看）不自动复制，只提示手动按键
 - 图片粘贴链路：浏览器取图 → 管理 API 落盘并写入 **本机（Mac）剪贴板** → 向 PTY 发 `^V`，让 Claude Code 像本地一样读图；非 mac 客户端的图只存在于对端剪贴板，必须由服务端写入 Mac 剪贴板
 - Claude Code / TUI 在 tmux 下一般可用（已关 status、aggressive-resize、低 escape-time）；若遇异常可在管理页新建干净会话
 - 停止会话会 `tmux kill-session`，其中进程结束；仅浏览器断开不会停止会话

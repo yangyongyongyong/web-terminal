@@ -94,8 +94,8 @@
   function hintText(pages, platform) {
     var n = Number(pages) || 30;
     var p = platform || detectPlatform();
-    if (p === "mac") return "滚轮回看约" + n + "页 · ⌘V/Ctrl+V 可贴图";
-    return "滚轮回看约" + n + "页 · Ctrl+V 贴文本 · Alt+V 贴图";
+    if (p === "mac") return "滚轮回看约" + n + "页 · ⌘V/Ctrl+V 可贴图 · 选中即复制";
+    return "滚轮回看约" + n + "页 · Ctrl+V 贴文本 · Alt+V 贴图 · 选中即复制";
   }
 
   /**

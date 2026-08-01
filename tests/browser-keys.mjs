@@ -1,6 +1,7 @@
 /**
  * 用本机 headless Chromium + CDP（真实时间，virtual-time 会截断 FileReader/createImageBitmap）
- * 跑 tests/fixtures/keys-harness.html，把每个场景的结果按 `key=value` 打印给 Python 断言。
+ * 跑 tests/fixtures/<fixture>.html（默认 keys-harness.html），把每个场景的结果
+ * 按 `key=value` 打印给 Python 断言。用法: node tests/browser-keys.mjs [fixture.html]
  * 找不到浏览器时打印 SKIP 并以 0 退出（其它机器上不阻塞测试）。
  */
 import { spawn } from 'node:child_process';
@@ -11,7 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const HARNESS = 'file://' + resolve(HERE, 'fixtures', 'keys-harness.html');
+const FIXTURE = process.argv[2] || 'keys-harness.html';
+const HARNESS = 'file://' + resolve(HERE, 'fixtures', FIXTURE);
 const PORT = Number(process.env.WT_CDP_PORT || 9333);
 
 function findChrome() {
@@ -45,7 +47,7 @@ if (!bin) {
 
 const chrome = spawn(bin, [
   '--headless', '--disable-gpu', '--no-first-run', '--allow-file-access-from-files',
-  `--remote-debugging-port=${PORT}`, `--user-data-dir=/tmp/wt-keys-cdp-${process.pid}`, 'about:blank',
+  `--remote-debugging-port=${PORT}`, `--user-data-dir=/tmp/wt-cdp-${process.pid}`, 'about:blank',
 ], { stdio: 'ignore' });
 
 let ws = null;

@@ -10,6 +10,7 @@ STOCK = ROOT / "web" / "ttyd-stock.html"
 OUT = ROOT / "web" / "ttyd-index.html"
 WHEEL_JS = ROOT / "web" / "wt-wheel.js"
 PASTE_JS = ROOT / "web" / "wt-paste-image.js"
+COPY_JS = ROOT / "web" / "wt-copy.js"
 ICON_SVG = ROOT / "web" / "wt-icon-term.svg"
 ICON_PNG = ROOT / "web" / "wt-icon-term-64.png"
 
@@ -63,6 +64,14 @@ def paste_js_for_inject() -> str:
     for need in ("hookKeys", "decideKeyAction", "decidePasteAction", "detectPlatform"):
         if need not in raw:
             raise SystemExit(f"{PASTE_JS} 缺少按系统分流的键位逻辑: {need}")
+    return raw
+
+
+def copy_js_for_inject() -> str:
+    raw = COPY_JS.read_text(encoding="utf-8")
+    for need in ("hookCopyOnSelect", "decideCopyAction", "copyText"):
+        if need not in raw:
+            raise SystemExit(f"{COPY_JS} 缺少选中即复制逻辑: {need}")
     return raw
 
 
@@ -127,6 +136,9 @@ __WHEEL_JS__
 </script>
 <script id="wt-paste-image">
 __PASTE_JS__
+</script>
+<script id="wt-copy">
+__COPY_JS__
 </script>
 <script id="wt-reconnect">
 (function () {
@@ -235,6 +247,7 @@ __PASTE_JS__
 
   var hookTries = 0;
   var keysHooked = false;
+  var copyHooked = false;
   var hookTimer = setInterval(function () {
     hookTries += 1;
     var ok = window.WtWheel && window.WtWheel.hookLocalWheel(function () { return window.term; });
@@ -242,7 +255,11 @@ __PASTE_JS__
     if (!keysHooked && window.WtPasteImage && window.WtPasteImage.hookKeys) {
       keysHooked = !!window.WtPasteImage.hookKeys(function () { return window.term; });
     }
-    if ((ok && keysHooked) || hookTries > 80) clearInterval(hookTimer);
+    // 选中即复制：走 xterm 的 onSelectionChange
+    if (!copyHooked && window.WtCopy && window.WtCopy.hookCopyOnSelect) {
+      copyHooked = !!window.WtCopy.hookCopyOnSelect(function () { return window.term; });
+    }
+    if ((ok && keysHooked && copyHooked) || hookTries > 80) clearInterval(hookTimer);
   }, 250);
 
   if (window.WtPasteImage && window.WtPasteImage.hookPasteImage) {
@@ -285,7 +302,8 @@ def build_inject() -> str:
     inject = inject.replace("__MANAGE_PORT__", manage_port())
     inject = inject.replace("__SCROLLBACK_PAGES__", pages)
     inject = inject.replace("__WHEEL_JS__", wheel_js_for_inject())
-    return inject.replace("__PASTE_JS__", paste_js_for_inject())
+    inject = inject.replace("__PASTE_JS__", paste_js_for_inject())
+    return inject.replace("__COPY_JS__", copy_js_for_inject())
 
 
 def main() -> int:
@@ -297,6 +315,9 @@ def main() -> int:
         return 1
     if not PASTE_JS.exists():
         print(f"缺少 {PASTE_JS}", file=sys.stderr)
+        return 1
+    if not COPY_JS.exists():
+        print(f"缺少 {COPY_JS}", file=sys.stderr)
         return 1
     for icon in (ICON_SVG, ICON_PNG):
         if not icon.exists():

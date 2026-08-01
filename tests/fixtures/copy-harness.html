@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>wt copy harness</title></head>
+<body><div id="wt-status">已连接</div>
+<script src="../../web/wt-copy.js"></script>
+<script>
+// 由 tests/browser-keys.mjs（同一 CDP 驱动）调 window.__run() 收集结果
+const R = [], note = (k, v) => R.push(k + '=' + v);
+const tick = (ms) => new Promise(r => setTimeout(r, ms || 30));
+const status = () => document.getElementById('wt-status').textContent;
+const toast = () => document.getElementById(WtCopy.TOAST_ID);
+
+// 假 term：可控的 selection + xterm 风格 onSelectionChange
+function makeTerm() {
+  const t = { sel: '', listeners: [] };
+  t.getSelection = () => t.sel;
+  t.hasSelection = () => !!t.sel;
+  t.onSelectionChange = (fn) => { t.listeners.push(fn); return { dispose() {} }; };
+  t.setSelection = (s) => { t.sel = s; t.listeners.forEach(fn => fn()); };
+  t.focus = () => {};
+  t.options = { macOptionClickForcesSelection: false };
+  return t;
+}
+
+window.__run = async () => {
+  try {
+    // ---------- 纯函数 ----------
+    note('decide_ok', WtCopy.decideCopyAction({ hasSelection: true, text: 'abc' }));
+    note('decide_blank', WtCopy.decideCopyAction({ hasSelection: true, text: ' \n\t ' }));
+    note('decide_nosel', WtCopy.decideCopyAction({ hasSelection: false, text: 'abc' }));
+    note('decide_dup', WtCopy.decideCopyAction({ hasSelection: true, text: 'abc', lastText: 'abc' }));
+    note('describe', WtCopy.describeCopied('ab') + ' / ' + WtCopy.describeCopied('a\nbb'));
+
+    // ---------- 剪贴板 API 可用 ----------
+    let written = [];
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: async (t) => { written.push(t); } }, configurable: true });
+    WtCopy.resetForTest();
+    const term = makeTerm();
+    note('hook', WtCopy.hookCopyOnSelect(() => term));
+    note('hookIdempotent', WtCopy.hookCopyOnSelect(() => term));
+    note('macOptionSelect', term.options.macOptionClickForcesSelection);
+
+    // 拖选：连续变化只应复制最终一次
+    term.setSelection('he'); term.setSelection('hel'); term.setSelection('hello world');
+    await tick(WtCopy.DEBOUNCE_MS + 120);
+    note('drag', 'writes:' + written.length + ' text:' + JSON.stringify(written[0]) + ' toast:' + (toast() && toast().textContent) + ' status:' + status());
+
+    // 同一段选中再次触发 → 不重复复制
+    written = []; term.setSelection('hello world');
+    await tick(WtCopy.DEBOUNCE_MS + 120);
+    note('dupSelection', 'writes:' + written.length);
+
+    // 清空选中（点击）→ 不复制、不提示；随后同样内容可再次复制
+    written = []; term.setSelection('');
+    await tick(WtCopy.DEBOUNCE_MS + 120);
+    note('cleared', 'writes:' + written.length);
+    term.setSelection('hello world');
+    await tick(WtCopy.DEBOUNCE_MS + 120);
+    note('recopyAfterClear', 'writes:' + written.length + ' text:' + JSON.stringify(written[0]));
+
+    // 纯空白选中 → 跳过
+    written = []; term.setSelection('   ');
+    await tick(WtCopy.DEBOUNCE_MS + 120);
+    note('blankSelection', 'writes:' + written.length);
+
+    // 多行：状态与气泡文案
+    written = []; term.setSelection('line1\nline2\nline3');
+    await tick(WtCopy.DEBOUNCE_MS + 120);
+    note('multiline', 'writes:' + written.length + ' toast:' + (toast() && toast().textContent));
+
+    // 气泡会自动消失，状态栏恢复成原来的「已连接」（连续复制也不能把提示当原状态）
+    await tick(WtCopy.DEBOUNCE_MS + 1900);
+    note('toastFades', !toast() || toast().style.opacity === '0');
+    note('statusRestored', status());
+
+    // 超大选中（如 ⌘A 全选整个回看缓冲）不静默塞满剪贴板
+    written = []; WtCopy.resetForTest();
+    term.setSelection('x'.repeat(WtCopy.MAX_CHARS + 1));
+    await tick(WtCopy.DEBOUNCE_MS + 150);
+    note('tooBig', 'writes:' + written.length + ' toast:' + (toast() && toast().textContent));
+
+    // ---------- 无剪贴板 API（局域网明文 http）→ execCommand 兜底 ----------
+    Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true });
+    let execArgs = [];
+    document.execCommand = (cmd) => { execArgs.push(cmd); return true; };
+    WtCopy.resetForTest();
+    const t2 = makeTerm(); WtCopy.hookCopyOnSelect(() => t2);
+    t2.setSelection('fallback text');
+    await tick(WtCopy.DEBOUNCE_MS + 150);
+    note('legacyFallback', 'exec:' + JSON.stringify(execArgs) + ' toast:' + (toast() && toast().textContent));
+
+    // ---------- 复制失败 → 明确提示，且不误导用非 mac 的 Ctrl+C ----------
+    document.execCommand = () => false;
+    WtCopy.resetForTest();
+    const t3 = makeTerm(); WtCopy.hookCopyOnSelect(() => t3);
+    t3.setSelection('will fail');
+    await tick(WtCopy.DEBOUNCE_MS + 150);
+    note('copyFail', (toast() && toast().textContent) + ' | status:' + status());
+    note('hintNoBareCtrlC', WtCopy.manualCopyHint().indexOf('Ctrl+C') < 0);
+
+    // 非 mac 客户端提示 Ctrl+Shift+C（终端里 Ctrl+C 是 SIGINT）
+    Object.defineProperty(navigator, 'userAgentData', { value: undefined, configurable: true });
+    Object.defineProperty(navigator, 'platform', { value: 'Win32', configurable: true });
+    Object.defineProperty(navigator, 'userAgent', { value: 'Mozilla/5.0 (Windows NT 10.0)', configurable: true });
+    note('winHint', WtCopy.manualCopyKey());
+  } catch (err) {
+    note('ERR', String((err && err.stack) || err).slice(0, 300));
+  }
+  return R;
+};
+</script></body></html>
