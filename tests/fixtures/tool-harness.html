@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>wt tool harness</title></head>
+<body><span id="wt-session">会话: demo</span><span id="wt-tool"></span>
+<script src="../../web/wt-tool.js"></script>
+<script>
+const R = [], note = (k, v) => R.push(k + '=' + v);
+const tick = (ms) => new Promise(r => setTimeout(r, ms || 30));
+const el = () => document.getElementById('wt-tool');
+
+let reply = { ok: true, kind: 'claude', label: 'Claude', cmd: 'claude' };
+let failNext = 0, urls = [];
+window.fetch = async (u) => {
+  urls.push(String(u));
+  if (failNext > 0) { failNext -= 1; throw new Error('boom'); }
+  return { ok: true, status: 200, json: async () => reply };
+};
+
+window.__run = async () => {
+  try {
+    // ---------- 纯函数 ----------
+    note('badgeClaude', WtTool.badgeText({ ok: true, kind: 'claude', label: 'Claude' }));
+    note('badgeShell', JSON.stringify(WtTool.badgeText({ ok: true, kind: 'shell', label: '' })));
+    note('badgeNull', JSON.stringify(WtTool.badgeText(null)));
+    note('badgeNoLabel', JSON.stringify(WtTool.badgeText({ ok: true, kind: 'other', label: '' })));
+    note('badgeNotOk', JSON.stringify(WtTool.badgeText({ ok: false, kind: 'claude', label: 'Claude' })));
+    note('colors', [WtTool.colorForKind('claude'), WtTool.colorForKind('codex'), WtTool.colorForKind('python'), WtTool.colorForKind('zzz')].join(','));
+    note('urlEncoded', WtTool.toolUrl('web终端'));
+    // 局域网直连时打到管理端口
+    window.WT_API_BASE = 'http://192.168.1.20:7690';
+    note('urlWithBase', WtTool.toolUrl('a'));
+    window.WT_API_BASE = '';
+
+    // ---------- 渲染 ----------
+    WtTool.renderTool(el(), { ok: true, kind: 'python', label: 'Python 3.14', cmd: 'python3.14' });
+    note('render', el().textContent + ' color:' + el().style.color + ' title:' + el().title);
+    WtTool.renderTool(el(), { ok: true, kind: 'shell', label: '', cmd: 'zsh' });
+    note('renderShellClears', JSON.stringify(el().textContent) + ' color:' + JSON.stringify(el().style.color));
+
+    // ---------- 轮询 ----------
+    const stop = WtTool.hookToolIndicator('demo', { pollMs: 60 });
+    await tick(150);
+    note('poll', el().textContent + ' requests>0:' + (urls.length > 0));
+
+    // 工具切换（用户从 claude 退出、进了 python）
+    reply = { ok: true, kind: 'python', label: 'Python 3.14', cmd: 'python3.14' };
+    await tick(200);
+    note('switch', el().textContent + ' color:' + el().style.color);
+
+    // 回到 shell → 徽标清空
+    reply = { ok: true, kind: 'shell', label: '', cmd: 'zsh' };
+    await tick(200);
+    note('backToShell', JSON.stringify(el().textContent));
+
+    // 连续失败 3 次后清空并退避（不再高频请求）
+    reply = { ok: true, kind: 'claude', label: 'Claude', cmd: 'claude' };
+    await tick(150);
+    note('recovered', el().textContent);
+    // 连续失败 3 次 → 清空徽标并退避 15s（不再高频重试）
+    // 注意：无头浏览器会节流 timer，这里给足时间窗，只断言最终状态
+    failNext = 99;
+    let thrown = 0;
+    const rawFetch = window.fetch;
+    window.fetch = async (u) => { try { return await rawFetch(u); } catch (e) { thrown += 1; throw e; } };
+    for (let i = 0; i < 40 && thrown < 3; i++) await tick(60);
+    const afterClear = urls.length;
+    await tick(400);
+    note('afterFailures', JSON.stringify(el().textContent) + ' thrown:' + thrown + ' backedOff:' + (urls.length === afterClear));
+
+    stop();
+    const afterStop = urls.length;
+    await tick(200);
+    note('stopped', urls.length === afterStop);
+    note('noTermNeeded', WtTool.hookToolIndicator('', {}) === null);
+  } catch (err) {
+    note('ERR', String((err && err.stack) || err).slice(0, 300));
+  }
+  return R;
+};
+</script></body></html>

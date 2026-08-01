@@ -12,6 +12,7 @@ WHEEL_JS = ROOT / "web" / "wt-wheel.js"
 PASTE_JS = ROOT / "web" / "wt-paste-image.js"
 COPY_JS = ROOT / "web" / "wt-copy.js"
 SEARCH_JS = ROOT / "web" / "wt-search.js"
+TOOL_JS = ROOT / "web" / "wt-tool.js"
 ICON_SVG = ROOT / "web" / "wt-icon-term.svg"
 ICON_PNG = ROOT / "web" / "wt-icon-term-64.png"
 
@@ -84,6 +85,14 @@ def search_js_for_inject() -> str:
     return raw
 
 
+def tool_js_for_inject() -> str:
+    raw = TOOL_JS.read_text(encoding="utf-8")
+    for need in ("hookToolIndicator", "badgeText", "/api/foreground"):
+        if need not in raw:
+            raise SystemExit(f"{TOOL_JS} 缺少前台工具识别逻辑: {need}")
+    return raw
+
+
 INJECT_HEAD = r"""
 <style id="wt-chrome">
   #wt-bar {
@@ -108,6 +117,7 @@ INJECT_HEAD = r"""
   <strong>web-terminal</strong>
   <a id="wt-manage-link" href="https://__PUBLIC_HOST__/" target="_blank" rel="noopener">会话管理</a>
   <span id="wt-session"></span>
+  <span id="wt-tool" style="font-weight:700"></span>
   <span id="wt-status">连接中…</span>
   <span id="wt-hint" style="color:#8b9aab">滚轮回看 · 支持粘贴图片</span>
 </div>
@@ -151,6 +161,9 @@ __COPY_JS__
 </script>
 <script id="wt-search">
 __SEARCH_JS__
+</script>
+<script id="wt-tool-js">
+__TOOL_JS__
 </script>
 <script id="wt-reconnect">
 (function () {
@@ -257,6 +270,13 @@ __SEARCH_JS__
   WrappedWS.CLOSED = NativeWS.CLOSED;
   window.WebSocket = WrappedWS;
 
+  // 顶栏显示当前前台交互式工具（Claude / Codex / Python …）
+  try {
+    if (window.WtTool && window.WtTool.hookToolIndicator) {
+      window.WtTool.hookToolIndicator(sessionName);
+    }
+  } catch (e) {}
+
   var hookTries = 0;
   var keysHooked = false;
   var copyHooked = false;
@@ -321,7 +341,8 @@ def build_inject() -> str:
     inject = inject.replace("__WHEEL_JS__", wheel_js_for_inject())
     inject = inject.replace("__PASTE_JS__", paste_js_for_inject())
     inject = inject.replace("__COPY_JS__", copy_js_for_inject())
-    return inject.replace("__SEARCH_JS__", search_js_for_inject())
+    inject = inject.replace("__SEARCH_JS__", search_js_for_inject())
+    return inject.replace("__TOOL_JS__", tool_js_for_inject())
 
 
 def main() -> int:
@@ -339,6 +360,9 @@ def main() -> int:
         return 1
     if not SEARCH_JS.exists():
         print(f"缺少 {SEARCH_JS}", file=sys.stderr)
+        return 1
+    if not TOOL_JS.exists():
+        print(f"缺少 {TOOL_JS}", file=sys.stderr)
         return 1
     for icon in (ICON_SVG, ICON_PNG):
         if not icon.exists():

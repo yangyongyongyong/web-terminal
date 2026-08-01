@@ -1035,6 +1035,113 @@ setInterval(() => { refresh().catch(() => {}); }, 8000);
 MANAGE_HTML = MANAGE_HTML.replace("__FAVICON__", favicon_links(), 1)
 
 
+# ---------- 前台交互式工具识别 ----------
+# tmux 的 #{pane_current_command} 不可靠：claude 会把进程名改成版本号（如 2.1.220），
+# codex / cursor-agent 又都显示成 node。所以走 pane 的 tty，用 ps 找真正的前台进程，
+# 再按完整 argv 判断是什么工具。
+TOOL_RULES: list[tuple[str, str, str]] = [
+    # (kind, 友好名, 在 argv 里匹配的正则)
+    ("claude", "Claude", r"(^|/)claude(\s|$)"),
+    ("codex", "Codex", r"(^|/)codex(\s|$|/)"),
+    ("opencode", "OpenCode", r"(^|/)opencode(\s|$)"),
+    ("cursor", "Cursor Agent", r"cursor-agent|(^|/)agent\s+--use-system-ca"),
+    ("gemini", "Gemini CLI", r"(^|/)gemini(\s|$)"),
+    ("aider", "Aider", r"(^|/)aider(\s|$)"),
+    ("ipython", "IPython", r"(^|/)ipython[\d.]*(\s|$)"),
+    ("python", "Python", r"(^|/)python[\d.]*(\s|$)"),
+    ("node", "Node", r"(^|/)node(\s|$)"),
+    ("deno", "Deno", r"(^|/)deno(\s|$)"),
+    ("bun", "Bun", r"(^|/)bun(\s|$)"),
+    ("scala", "Scala", r"(^|/)(scala|scala-cli|sbt|amm)[\d.]*(\s|$)"),
+    ("ruby", "Ruby", r"(^|/)(irb|pry|ruby)(\s|$)"),
+    ("php", "PHP", r"(^|/)php(\s|$)"),
+    ("db", "psql", r"(^|/)psql(\s|$)"),
+    ("db", "MySQL", r"(^|/)mysql(\s|$)"),
+    ("db", "SQLite", r"(^|/)sqlite3?(\s|$)"),
+    ("db", "Redis", r"(^|/)redis-cli(\s|$)"),
+    ("db", "mongosh", r"(^|/)mongosh(\s|$)"),
+    ("editor", "Neovim", r"(^|/)nvim(\s|$)"),
+    ("editor", "Vim", r"(^|/)vim?(\s|$)"),
+    ("editor", "Emacs", r"(^|/)emacs(\s|$)"),
+    ("editor", "nano", r"(^|/)nano(\s|$)"),
+    ("pager", "less", r"(^|/)(less|more)(\s|$)"),
+    ("pager", "man", r"(^|/)man(\s|$)"),
+    ("monitor", "top", r"(^|/)(top|htop|btop)(\s|$)"),
+    ("k8s", "k9s", r"(^|/)k9s(\s|$)"),
+    ("ssh", "SSH", r"(^|/)(ssh|mosh)(\s|$)"),
+    ("tail", "tail -f", r"(^|/)tail\s+.*-f|(^|/)tail\s+-f"),
+]
+SHELL_NAMES = {"sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "login", "-zsh", "-bash"}
+
+
+def label_process(args: str) -> dict[str, str]:
+    """完整 argv → {kind, label, cmd}。shell 本身返回 kind=shell（前端不显示）。"""
+    argv = (args or "").strip()
+    if not argv:
+        return {"kind": "", "label": "", "cmd": ""}
+    argv0 = argv.split()[0]
+    base = argv0.rsplit("/", 1)[-1].lstrip("-")
+    if base in SHELL_NAMES or argv0.lstrip("-") in SHELL_NAMES:
+        return {"kind": "shell", "label": "", "cmd": base}
+    for kind, label, pattern in TOOL_RULES:
+        if re.search(pattern, argv):
+            # python3.14 / scala3 之类带版本的，把版本缀上去更直观
+            m = re.match(r"^[a-zA-Z_-]+(\d+\.[\d.]+)$", base)
+            if m and label.lower().rstrip("0123456789.") in base.lower():
+                return {"kind": kind, "label": f"{label} {m.group(1)}", "cmd": base}
+            return {"kind": kind, "label": label, "cmd": base}
+    return {"kind": "other", "label": base, "cmd": base}
+
+
+def tmux_pane(sid: str) -> dict[str, str]:
+    cp = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", f"{sid}:", "#{pane_tty}\t#{pane_pid}"],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        env={**os.environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+    if cp.returncode != 0:
+        return {}
+    parts = (cp.stdout or "").strip().split("\t")
+    if len(parts) < 2:
+        return {}
+    return {"tty": parts[0], "pid": parts[1]}
+
+
+def foreground_process(sid: str) -> dict[str, str]:
+    """pane 里真正的前台进程：tty 上带 '+'（前台进程组）且父进程是 pane 内 shell 的那个。"""
+    pane = tmux_pane(sid)
+    tty = pane.get("tty", "")
+    pane_pid = pane.get("pid", "")
+    if not tty or not pane_pid:
+        return {"kind": "", "label": "", "cmd": ""}
+    cp = subprocess.run(
+        ["ps", "-t", tty.replace("/dev/", ""), "-o", "pid=,ppid=,stat=,args="],
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    if cp.returncode != 0:
+        return {"kind": "", "label": "", "cmd": ""}
+    rows = []
+    for line in (cp.stdout or "").splitlines():
+        fields = line.strip().split(None, 3)
+        if len(fields) < 4:
+            continue
+        rows.append({"pid": fields[0], "ppid": fields[1], "stat": fields[2], "args": fields[3]})
+    fg = [r for r in rows if "+" in r["stat"]]
+    # 直接挂在 pane shell 下的前台进程 = 用户手敲进入的那个（再深的是它自己拉起的子进程）
+    direct = [r for r in fg if r["ppid"] == pane_pid]
+    if direct:
+        return label_process(direct[0]["args"])
+    if any(r["pid"] == pane_pid for r in fg):
+        return {"kind": "shell", "label": "", "cmd": "shell"}  # 就在 shell 提示符上
+    if fg:
+        return label_process(fg[0]["args"])
+    return {"kind": "shell", "label": "", "cmd": "shell"}
+
+
 def run_ctl(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [SESSION_CTL, *args],
@@ -1386,8 +1493,7 @@ class Handler(BaseHTTPRequestHandler):
             return []
         if u.scheme not in ("http", "https") or not u.hostname:
             return []
-        if u.hostname in ("localhost", "127.0.0.1"):
-            return []  # 同机 loopback 不涉及跨端口场景，无需 CORS
+        # loopback 也要放行：127.0.0.1:<ttyd> → 127.0.0.1:<manage> 同样是跨源（端口不同）
         want_port = str(u.port or "")
         if want_port != str(TTYD_PORT):
             return []
@@ -1401,12 +1507,14 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         cors = self._lan_cors_headers()
-        if path == "/api/paste-image" and cors:
+        # 局域网/跨端口直连时，终端页对 /api/* 的预检都要能过（带 Authorization 的
+        # 请求会触发 preflight），放行范围仍只限同机 ttyd 源
+        if path.startswith("/api/") and cors:
             self.send_response(204)
             for k, v in cors:
                 self.send_header(k, v)
-            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
             self.send_header("Access-Control-Max-Age", "600")
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -1453,6 +1561,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._binary(200, ICON_SVG.read_bytes(), "image/svg+xml")
             except OSError:
                 self._json(404, {"error": "no icon"})
+            return
+        if path == "/api/foreground":
+            cors = self._lan_cors_headers()
+            name = (parse_qs(parsed.query).get("name") or [""])[0].strip()
+            if not NAME_RE.match(name):
+                self._json(400, {"error": "无效会话名"}, cors)
+                return
+            sid = "wt-" + session_ticket.sanitize_name(name)
+            try:
+                info = foreground_process(sid)
+            except (OSError, subprocess.SubprocessError):
+                info = {"kind": "", "label": "", "cmd": ""}
+            self._json(200, {"ok": True, "name": name, **info}, cors)
             return
         if path == "/api/health":
             self._json(

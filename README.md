@@ -15,6 +15,7 @@
 - **会话管理**：首页可查看当前会话、历史（已停止）、新建 / 打开 / 停止
 - **进入 PIN**：打开/新建终端需输入 `.env` 的 `SESSION_PIN`（与 Basic Auth 分离；界面不提示规则）
 - **工作目录**：新建时可指定路径，且必须在 `SESSION_PATH_ROOT` 下；管理页支持按名称/路径关键字检索
+- **前台工具徽标**：顶栏在「会话: xxx」后面彩色显示当前正在用的交互式工具（Claude / Codex / Cursor Agent / Python / Scala / vim / psql …），回到 shell 提示符自动隐藏
 - **文本搜索**：`⌘F`（mac）/ `Ctrl+F`（Windows·Linux）打开搜索条，命中全部上底色、当前命中额外高亮并滚动到可见；回车下一个、`Shift+回车`上一个、`Esc` 关闭；选中文字后按 `⌘F` 直接带入关键词
 - **选中即复制**：终端里鼠标选中文本立刻写入客户端剪贴板，并在鼠标旁浮出「已复制 N 字」；应用开了鼠标上报（Claude Code 等 TUI）时用 `Option+拖选`（mac）/ `Shift+拖选`（Windows/Linux）
 - **标签页图标**：终端页（绿）/ 管理页（蓝）各有高对比 favicon —— ttyd 自带图标是黑底黑字，深色标签栏里等于没图标
@@ -86,6 +87,7 @@ web-terminal/
 ## 说明
 
 - 默认会话名 `main`；URL 形如 `/term/?arg=work` 或新建 `/term/?arg=work&arg=create`
+- 工具识别在服务端 `/api/foreground`：tmux 的 `#{pane_current_command}` 不可靠（claude 把进程名改成版本号、codex 与 cursor-agent 都显示 `node`），改为按 pane 的 tty 找带 `+` 的前台进程、且父进程是 pane 内 shell 的那个，再按完整 argv 命名
 - 搜索按折行（`isWrapped`）合并逻辑行再匹配，跨行断开的词也能命中；命中位置按 cell 换算，中日韩宽字符不会错列；搜索用的选中高亮不会进剪贴板
 - 复制链路：优先 `navigator.clipboard.writeText`（HTTPS/本机），局域网明文 http 下退回 `execCommand('copy')`；超过 10 万字符（如 ⌘A 全选回看）不自动复制，只提示手动按键
 - 图片粘贴链路：浏览器取图 → 管理 API 落盘并写入 **本机（Mac）剪贴板** → 向 PTY 发 `^V`，让 Claude Code 像本地一样读图；非 mac 客户端的图只存在于对端剪贴板，必须由服务端写入 Mac 剪贴板
