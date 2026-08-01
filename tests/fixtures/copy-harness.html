@@ -18,6 +18,8 @@ function makeTerm() {
   t.setSelection = (s) => { t.sel = s; t.listeners.forEach(fn => fn()); };
   t.focus = () => {};
   t.options = { macOptionClickForcesSelection: false };
+  t.oscHandlers = {};
+  t.parser = { registerOscHandler: (id, fn) => { t.oscHandlers[id] = fn; return { dispose() {} }; } };
   return t;
 }
 
@@ -97,6 +99,41 @@ window.__run = async () => {
     await tick(WtCopy.DEBOUNCE_MS + 150);
     note('copyFail', (toast() && toast().textContent) + ' | status:' + status());
     note('hintNoBareCtrlC', WtCopy.manualCopyHint().indexOf('Ctrl+C') < 0);
+
+    // ---------- OSC 52：终端里的应用（Claude Code 等）自己请求写剪贴板 ----------
+    // 这类应用开了鼠标上报、自己处理拖选，xterm 不会产生 selection；
+    // ttyd 的 xterm 没装 ClipboardAddon，OSC 52 本来会被丢掉 → 应用说「已复制」
+    // 但剪贴板其实没变。这里必须接住。
+    const b64 = (str) => btoa(String.fromCharCode(...new TextEncoder().encode(str)));
+    let osc = [];
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: async (t) => { osc.push(t); } }, configurable: true });
+    WtCopy.resetForTest();
+    const t4 = makeTerm();
+    note('osc52Hook', WtCopy.hookOsc52(() => t4) + ' registered:' + !!t4.oscHandlers[52]);
+    note('osc52Idempotent', WtCopy.hookOsc52(() => t4));
+
+    const handler = t4.oscHandlers[52];
+    note('osc52Swallowed', handler('c;' + b64('复制我 abc')));
+    await tick(120);
+    note('osc52Copy', 'writes:' + JSON.stringify(osc) + ' toast:' + (toast() && toast().textContent));
+
+    // 与「选中即复制」文案一致
+    note('osc52SameWording', (toast() && toast().textContent) === WtCopy.describeCopied('复制我 abc'));
+
+    // 紧接着同样内容的选中不该再提示一遍（共享去重）
+    osc = []; t4.setSelection('复制我 abc');
+    await tick(WtCopy.DEBOUNCE_MS + 120);
+    note('osc52Dedup', 'writes:' + osc.length);
+
+    // 读请求 / 垃圾 / 超长：都吞掉且不动剪贴板
+    osc = [];
+    const swallowed = [handler('c;?'), handler('garbage'), handler('c;@@@bad@@@'), handler('c;' + 'A'.repeat(WtCopy.MAX_OSC52_B64 + 1))];
+    await tick(120);
+    note('osc52Ignored', 'swallowed:' + JSON.stringify(swallowed) + ' writes:' + osc.length);
+
+    // 没有 parser 的 term 不该炸
+    note('osc52NoParser', WtCopy.hookOsc52({}) === false);
 
     // 非 mac 客户端提示 Ctrl+Shift+C（终端里 Ctrl+C 是 SIGINT）
     Object.defineProperty(navigator, 'userAgentData', { value: undefined, configurable: true });

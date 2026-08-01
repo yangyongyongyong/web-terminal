@@ -41,6 +41,15 @@ BROWSER_EXPECTED = {
     "legacyFallback": 'exec:["copy"] toast:已复制 13 字',
     "copyFail": "复制失败，请用 ⌘C | status:复制失败，请用 ⌘C",
     "hintNoBareCtrlC": "true",
+    # OSC 52：应用自己请求写剪贴板（Claude Code 这类自己处理拖选的 TUI）
+    "osc52Hook": "true registered:true",
+    "osc52Idempotent": "true",
+    "osc52Swallowed": "true",
+    "osc52Copy": 'writes:["复制我 abc"] toast:已复制 7 字',
+    "osc52SameWording": "true",
+    "osc52Dedup": "writes:0",
+    "osc52Ignored": "swallowed:[true,true,true,true] writes:0",
+    "osc52NoParser": "true",
     "winHint": "Ctrl+Shift+C",
 }
 
@@ -63,6 +72,10 @@ def test_source_keywords() -> None:
         "execCommand",
         "MAX_CHARS",
         "DEBOUNCE_MS",
+        # 应用侧复制（OSC 52）必须被接住，否则 ttyd 的 xterm 会直接丢掉
+        "registerOscHandler",
+        "decodeOsc52",
+        "hookOsc52",
     ):
         if key not in raw:
             fail(f"wt-copy.js 缺少 {key}")
@@ -89,6 +102,17 @@ assert(c.decideCopyAction({ hasSelection: true, text: 'abcd', maxChars: 3 }) ===
 assert(c.describeCopied('abc') === '已复制 3 字', '单行文案');
 assert(c.describeCopied('a\nb') === '已复制 2 行 · 3 字', '多行文案');
 assert(c.describeCopied('') === '已复制 0 字', '空文案不炸');
+
+// OSC 52 负载解析
+const b64 = (str) => Buffer.from(str, 'utf8').toString('base64');
+assert(c.decodeOsc52('c;' + b64('hello')).text === 'hello', 'c;base64');
+assert(c.decodeOsc52(';' + b64('hi')).text === 'hi', '空 targets 也要认');
+assert(c.decodeOsc52('c;' + b64('中文 ✅')).text === '中文 ✅', 'UTF-8 不能乱码');
+assert(c.decodeOsc52('c;?').query === true, 'c;? 是读请求');
+assert(c.decodeOsc52('garbage') === null, '没有分号 → 解析失败');
+assert(c.decodeOsc52('c;@@@bad@@@') === null, '坏 base64 → 解析失败');
+assert(c.decodeOsc52('c;' + 'A'.repeat(c.MAX_OSC52_B64 + 1)) === null, '超长 → 拒绝');
+assert(c.decodeOsc52('c;').text === '', '空负载不炸');
 
 // 终端里 Ctrl+C 是 SIGINT，任何平台的提示都不能是裸 Ctrl+C
 assert(c.manualCopyHint().indexOf('Ctrl+C') < 0, '不能提示裸 Ctrl+C');

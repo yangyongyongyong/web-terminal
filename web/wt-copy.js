@@ -20,6 +20,8 @@
   var DEBOUNCE_MS = 120;
   /** 超过这个字符数不自动复制：⌘A 全选整屏回看可能有几十万字符 */
   var MAX_CHARS = 100000;
+  /** OSC 52 里 base64 的长度上限（约 1.5MB 文本） */
+  var MAX_OSC52_B64 = 2 * 1024 * 1024;
   var TOAST_MS = 1200;
   var TOAST_ID = "wt-copy-toast";
   var lastText = "";
@@ -209,6 +211,75 @@
     return { ok: ok, action: "copy", text: text };
   }
 
+  function b64ToText(b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    if (typeof TextDecoder === "function") return new TextDecoder("utf-8").decode(bytes);
+    return decodeURIComponent(escape(bin));
+  }
+
+  /**
+   * 解析 OSC 52 负载（纯函数）。形如 "c;<base64>"、";<base64>"、"c;?"（读请求）。
+   * @returns {{targets:string,query:boolean,text:string}|null} null = 解析失败
+   */
+  function decodeOsc52(data) {
+    var raw = String(data == null ? "" : data);
+    var semi = raw.indexOf(";");
+    if (semi < 0) return null;
+    var targets = raw.slice(0, semi);
+    var payload = raw.slice(semi + 1);
+    if (payload === "?") return { targets: targets, query: true, text: "" };
+    if (!payload) return { targets: targets, query: false, text: "" };
+    if (payload.length > MAX_OSC52_B64) return null;
+    var text = "";
+    try {
+      text = b64ToText(payload);
+    } catch (e) {
+      return null;
+    }
+    return { targets: targets, query: false, text: text };
+  }
+
+  /**
+   * 终端里的应用（Claude Code / tmux / vim 等）用 OSC 52 请求写剪贴板。
+   * ttyd 的 xterm 没装 ClipboardAddon，这段序列本来会被直接丢掉：应用提示
+   * 「copied N chars」但浏览器剪贴板其实没变，粘出来是旧内容。这里接住它，
+   * 写进客户端剪贴板，并用与「选中即复制」完全一致的提示。
+   */
+  function handleOsc52(term, data) {
+    var info = decodeOsc52(data);
+    if (!info || info.query || !info.text) return true; // 吞掉，别把乱码写到屏幕上
+    lastText = info.text; // 与选中即复制共享去重，避免紧接着再提示一遍
+    copyText(info.text).then(function (ok) {
+      if (ok) {
+        var msg = describeCopied(info.text);
+        showToast(msg, true);
+        setStatus(msg, "", TOAST_MS + 300);
+      } else {
+        showToast(manualCopyHint(), false);
+        setStatus(manualCopyHint(), "err", 2000);
+      }
+    });
+    return true;
+  }
+
+  function hookOsc52(getTerm) {
+    var term = typeof getTerm === "function" ? getTerm() : getTerm;
+    if (!term || !term.parser || typeof term.parser.registerOscHandler !== "function") return false;
+    if (term._wtOsc52Hook) return true;
+    term._wtOsc52Hook = true;
+    try {
+      term.parser.registerOscHandler(52, function (data) {
+        return handleOsc52(term, data);
+      });
+    } catch (e) {
+      term._wtOsc52Hook = false;
+      return false;
+    }
+    return true;
+  }
+
   /** 选中即复制：挂 onSelectionChange（覆盖拖选/双击词/三击行/全选） */
   function hookCopyOnSelect(getTerm) {
     var term = typeof getTerm === "function" ? getTerm() : getTerm;
@@ -239,6 +310,11 @@
         true
       );
     }
+
+    // 应用自己用 OSC 52 复制（Claude Code 这类开了鼠标上报、自己处理拖选的 TUI）
+    hookOsc52(function () {
+      return typeof getTerm === "function" ? getTerm() : term;
+    });
 
     var timer = null;
     term.onSelectionChange(function () {
@@ -277,6 +353,10 @@
     manualCopyHint: manualCopyHint,
     manualCopyKey: manualCopyKey,
     suppress: suppress,
+    decodeOsc52: decodeOsc52,
+    handleOsc52: handleOsc52,
+    hookOsc52: hookOsc52,
+    MAX_OSC52_B64: MAX_OSC52_B64,
     MAX_CHARS: MAX_CHARS,
     resetForTest: resetForTest,
     TOAST_ID: TOAST_ID,

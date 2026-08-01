@@ -44,6 +44,18 @@ def test_tmux_alternate_screen_on() -> None:
     ok("tmux alternate-screen on")
 
 
+def test_tmux_set_clipboard() -> None:
+    """应用（Claude Code / vim）用 OSC 52 复制时必须转发给浏览器，
+    否则应用提示「已复制」而剪贴板没变，粘出来是旧内容。"""
+    text = TMUX_CONF.read_text(encoding="utf-8")
+    vals = re.findall(r"^\s*set\s+-g\s+set-clipboard\s+(\w+)", text, flags=re.M)
+    if not vals:
+        fail("tmux.web.conf 缺少 set -g set-clipboard（需 external/on 才会转发 OSC 52）")
+    if vals[-1] not in ("external", "on"):
+        fail(f"set-clipboard={vals[-1]}，必须是 external 或 on")
+    ok("tmux set-clipboard 转发 OSC 52")
+
+
 def test_ttyd_scrollback_option() -> None:
     run = (ROOT / "bin" / "run-ttyd.sh").read_text(encoding="utf-8")
     if "scrollback=" not in run or "SCROLLBACK_PAGES" not in run:
@@ -153,6 +165,7 @@ def test_live_tmux_mouse_off() -> None:
 def main() -> int:
     test_tmux_mouse_off()
     test_tmux_alternate_screen_on()
+    test_tmux_set_clipboard()
     test_ttyd_scrollback_option()
     test_attach_no_scroll_flood()
     test_wheel_policy_source()
