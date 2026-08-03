@@ -13,6 +13,7 @@ PASTE_JS = ROOT / "web" / "wt-paste-image.js"
 COPY_JS = ROOT / "web" / "wt-copy.js"
 SEARCH_JS = ROOT / "web" / "wt-search.js"
 TOOL_JS = ROOT / "web" / "wt-tool.js"
+VIEWPORT_JS = ROOT / "web" / "wt-viewport.js"
 ICON_SVG = ROOT / "web" / "wt-icon-term.svg"
 ICON_PNG = ROOT / "web" / "wt-icon-term-64.png"
 
@@ -93,6 +94,14 @@ def tool_js_for_inject() -> str:
     return raw
 
 
+def viewport_js_for_inject() -> str:
+    raw = VIEWPORT_JS.read_text(encoding="utf-8")
+    for need in ("hookViewportResizeKick", "supportsDvh"):
+        if need not in raw:
+            raise SystemExit(f"{VIEWPORT_JS} 缺少视口修复逻辑: {need}")
+    return raw
+
+
 INJECT_HEAD = r"""
 <style id="wt-chrome">
   #wt-bar {
@@ -109,8 +118,17 @@ INJECT_HEAD = r"""
   #wt-status.warn { color: #e6c07b; }
   #wt-status.err { color: #f07178; }
   body.wt-has-bar { padding-top: 32px !important; box-sizing: border-box; }
+  /* 兜底：不支持 100dvh 的老浏览器用这条 */
   body.wt-has-bar #terminal-container,
   body.wt-has-bar .xterm { height: calc(100vh - 32px) !important; }
+  /* 首选：动态视口高度，随地址栏/手势导航条展开收起实时变化——
+     Android 上地址栏/手势条撑开时 100vh 不会跟着变小，容器比可见区域高，
+     底下几行会被系统 UI 盖住（看起来像一条白色横条压住终端底部）。
+     不支持 @supports 或 dvh 的浏览器整条规则会被忽略，回落到上面的 100vh。 */
+  @supports (height: 100dvh) {
+    body.wt-has-bar #terminal-container,
+    body.wt-has-bar .xterm { height: calc(100dvh - 32px) !important; }
+  }
   .xterm-viewport { scroll-behavior: auto !important; }
 </style>
 <div id="wt-bar">
@@ -164,6 +182,12 @@ __SEARCH_JS__
 </script>
 <script id="wt-tool-js">
 __TOOL_JS__
+</script>
+<script id="wt-viewport">
+__VIEWPORT_JS__
+try {
+  window.WtViewport && window.WtViewport.hookViewportResizeKick();
+} catch (e) {}
 </script>
 <script id="wt-reconnect">
 (function () {
@@ -342,7 +366,8 @@ def build_inject() -> str:
     inject = inject.replace("__PASTE_JS__", paste_js_for_inject())
     inject = inject.replace("__COPY_JS__", copy_js_for_inject())
     inject = inject.replace("__SEARCH_JS__", search_js_for_inject())
-    return inject.replace("__TOOL_JS__", tool_js_for_inject())
+    inject = inject.replace("__TOOL_JS__", tool_js_for_inject())
+    return inject.replace("__VIEWPORT_JS__", viewport_js_for_inject())
 
 
 def main() -> int:
@@ -363,6 +388,9 @@ def main() -> int:
         return 1
     if not TOOL_JS.exists():
         print(f"缺少 {TOOL_JS}", file=sys.stderr)
+        return 1
+    if not VIEWPORT_JS.exists():
+        print(f"缺少 {VIEWPORT_JS}", file=sys.stderr)
         return 1
     for icon in (ICON_SVG, ICON_PNG):
         if not icon.exists():

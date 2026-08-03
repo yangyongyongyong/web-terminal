@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>wt viewport harness</title></head>
+<body>
+<script src="../../web/wt-viewport.js"></script>
+<script>
+// 由 tests/browser-keys.mjs（同一 CDP 驱动）调 window.__run() 收集结果
+const R = [], note = (k, v) => R.push(k + '=' + v);
+const tick = (ms) => new Promise(r => setTimeout(r, ms || 30));
+
+window.__run = async () => {
+  try {
+    note('supportsDvhIsBoolean', typeof WtViewport.supportsDvh());
+
+    // 真的没有 visualViewport 的老浏览器：必须安全返回 false，且不能误置「已挂载」标记
+    const realVV = window.visualViewport;
+    Object.defineProperty(window, 'visualViewport', { value: undefined, configurable: true });
+    note('noVisualViewport', WtViewport.hookViewportResizeKick());
+    note('flagNotSetYet', document.documentElement._wtViewportHook !== true);
+
+    // 用假的 EventTarget 模拟 visualViewport：连续事件应去抖成一次合成 resize
+    class FakeVV extends EventTarget {}
+    const vv1 = new FakeVV();
+    let resizeCount = 0;
+    const onResize = () => { resizeCount += 1; };
+    window.addEventListener('resize', onResize);
+
+    const hooked = WtViewport.hookViewportResizeKick({ visualViewport: vv1, debounceMs: 30 });
+    note('hooked', hooked);
+
+    vv1.dispatchEvent(new Event('resize'));
+    vv1.dispatchEvent(new Event('resize'));
+    vv1.dispatchEvent(new Event('resize'));
+    await tick(150);
+    note('debouncedBurst', resizeCount); // 连续 3 次只应派发 1 次
+
+    // scroll 也要触发（Android 手势条常在滚动时联动展开/收起）
+    resizeCount = 0;
+    vv1.dispatchEvent(new Event('scroll'));
+    await tick(150);
+    note('scrollTriggers', resizeCount);
+
+    // 幂等：已经挂过，第二次传不同假对象应直接返回 true 且不重复挂听
+    const vv2 = new FakeVV();
+    const hookedAgain = WtViewport.hookViewportResizeKick({ visualViewport: vv2, debounceMs: 30 });
+    resizeCount = 0;
+    vv2.dispatchEvent(new Event('resize'));
+    await tick(150);
+    note('idempotent', hookedAgain + ' vv2Ignored:' + (resizeCount === 0));
+
+    window.removeEventListener('resize', onResize);
+    Object.defineProperty(window, 'visualViewport', { value: realVV, configurable: true });
+
+    // kickResize 直接调用：应该真的派发一个 window resize 事件
+    let direct = 0;
+    const onDirect = () => { direct += 1; };
+    window.addEventListener('resize', onDirect);
+    const ok = WtViewport.kickResize();
+    await tick(30);
+    note('kickResizeDirect', ok + ' fired:' + (direct === 1));
+    window.removeEventListener('resize', onDirect);
+  } catch (err) {
+    note('ERR', String((err && err.stack) || err).slice(0, 300));
+  }
+  return R;
+};
+</script></body></html>
