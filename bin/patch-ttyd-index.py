@@ -137,6 +137,7 @@ INJECT_HEAD = r"""
   <span id="wt-session"></span>
   <span id="wt-tool" style="font-weight:700"></span>
   <span id="wt-status">连接中…</span>
+  <span id="wt-traffic" style="color:#8b9aab"></span>
   <span id="wt-hint" style="color:#8b9aab">滚轮回看 · 支持粘贴图片</span>
 </div>
 <script id="wt-wheel">
@@ -188,6 +189,85 @@ __VIEWPORT_JS__
 try {
   window.WtViewport && window.WtViewport.hookViewportResizeKick();
 } catch (e) {}
+</script>
+<script id="wt-traffic-meter">
+(function () {
+  // 统计本会话经 WebSocket 实际收发的字节（即真正过网的量），
+  // 每 5s 把增量上报给管理服务按「日期+会话」累加，页面刷新后累计值不丢。
+  var params = new URLSearchParams(location.search);
+  var name = params.getAll('arg')[0] || 'main';
+  var pendRx = 0, pendTx = 0;   // 未上报的增量
+  var baseTotal = 0;            // 服务端已记录的本会话累计
+  var liveTotal = 0;            // 本页新产生的量
+
+  function fmt(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + ' B';
+    var u = ['KB', 'MB', 'GB', 'TB'], i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+    return (n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
+  }
+
+  function paint() {
+    var el = document.getElementById('wt-traffic');
+    if (el) el.textContent = '本会话流量 ' + fmt(baseTotal + liveTotal);
+  }
+
+  function apiUrl(p) {
+    var b = window.WT_API_BASE || '';
+    return b + p;
+  }
+
+  window.WtTraffic = {
+    addRx: function (n) { n = Number(n) || 0; if (n > 0) { pendRx += n; liveTotal += n; } },
+    addTx: function (n) { n = Number(n) || 0; if (n > 0) { pendTx += n; liveTotal += n; } }
+  };
+
+  // 先取服务端已有累计，作为显示基数
+  fetch(apiUrl('/api/traffic?name=' + encodeURIComponent(name)), { credentials: 'include' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) { if (d) { baseTotal = Number(d.session_total) || 0; paint(); } })
+    .catch(function () {});
+  paint();
+
+  function report() {
+    if (pendRx <= 0 && pendTx <= 0) { paint(); return; }
+    var rx = pendRx, tx = pendTx;
+    pendRx = 0; pendTx = 0;
+    fetch(apiUrl('/api/traffic'), {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, rx: rx, tx: tx })
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (d && typeof d.session_total === 'number') {
+          // 以服务端权威值校准，避免多标签/重连造成偏差
+          baseTotal = d.session_total;
+          liveTotal = 0;
+        }
+        paint();
+      })
+      .catch(function () {
+        // 上报失败则退回待发队列，下次重试，不丢数
+        pendRx += rx; pendTx += tx;
+        paint();
+      });
+  }
+  setInterval(report, 5000);
+  // 关页前尽力补报最后一段
+  window.addEventListener('pagehide', function () {
+    if (pendRx <= 0 && pendTx <= 0) return;
+    try {
+      var body = JSON.stringify({ name: name, rx: pendRx, tx: pendTx });
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(apiUrl('/api/traffic'), new Blob([body], { type: 'application/json' }));
+        pendRx = 0; pendTx = 0;
+      }
+    } catch (e) {}
+  });
+})();
 </script>
 <script id="wt-reconnect">
 (function () {
@@ -260,6 +340,32 @@ try {
   var NativeWS = window.WebSocket;
   function WrappedWS(url, protocols) {
     var ws = (protocols === undefined) ? new NativeWS(url) : new NativeWS(url, protocols);
+    // 计流量：统计真正过网的字节。收到的是 ArrayBuffer/Blob/字符串三种可能。
+    ws.addEventListener('message', function (ev) {
+      if (!window.WtTraffic) return;
+      var d = ev.data, n = 0;
+      try {
+        if (d == null) n = 0;
+        else if (typeof d === 'string') n = d.length;           // ttyd 文本帧按字符近似
+        else if (typeof d.byteLength === 'number') n = d.byteLength;
+        else if (typeof d.size === 'number') n = d.size;
+      } catch (e) {}
+      window.WtTraffic.addRx(n);
+    });
+    var origSend = ws.send;
+    ws.send = function (payload) {
+      if (window.WtTraffic) {
+        var n = 0;
+        try {
+          if (payload == null) n = 0;
+          else if (typeof payload === 'string') n = payload.length;
+          else if (typeof payload.byteLength === 'number') n = payload.byteLength;
+          else if (typeof payload.size === 'number') n = payload.size;
+        } catch (e) {}
+        window.WtTraffic.addTx(n);
+      }
+      return origSend.call(ws, payload);
+    };
     ws.addEventListener('open', function () {
       openedOnce = true;
       delay = 1000;

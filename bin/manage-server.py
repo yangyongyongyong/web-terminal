@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -74,6 +75,34 @@ def _lan_ip_rank(ip: str) -> int:
     return 50      # 其它可路由/私有地址：可用但不如标准私有段
 
 
+def _active_iface_ipv4s() -> list[str]:
+    """macOS：ifconfig -l 列网卡 + ipconfig getifaddr 取地址。
+    只有真实已配置(DHCP/手动)的网卡才有返回值，天然排除 utun 隧道与 lo0，
+    比解析 ifconfig 全量 inet 更准——后者会把 VPN 的 198.18.0.1 也算进来。"""
+    ips: list[str] = []
+    try:
+        names = subprocess.run(
+            ["ifconfig", "-l"], capture_output=True, text=True, timeout=2
+        ).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return ips
+    for nic in names:
+        if nic.startswith(("lo", "utun", "gif", "stf", "awdl", "llw", "bridge")):
+            continue
+        try:
+            ip = subprocess.run(
+                ["ipconfig", "getifaddr", nic],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if ip and ip not in ips:
+            ips.append(ip)
+    return ips
+
+
 def _candidate_ipv4s() -> list[str]:
     import socket
 
@@ -83,6 +112,9 @@ def _candidate_ipv4s() -> list[str]:
         if ip and ip not in found:
             found.append(ip)
 
+    # 真实活动网卡（Wi-Fi/有线）优先，隧道地址不会出现在这里
+    for ip in _active_iface_ipv4s():
+        add(ip)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -98,10 +130,8 @@ def _candidate_ipv4s() -> list[str]:
             add(ip)
     except OSError:
         pass
-    # macOS/Linux：枚举所有网卡地址，覆盖 Wi-Fi/有线，避免只拿到 VPN 出口
+    # 兜底：解析 ifconfig 全量 inet（可能含隧道地址，靠打分与活动网卡优先排后）
     try:
-        import subprocess
-
         out = subprocess.run(
             ["ifconfig"], capture_output=True, text=True, timeout=2
         ).stdout
@@ -114,17 +144,65 @@ def _candidate_ipv4s() -> list[str]:
     return found
 
 
+def _probe_lan() -> tuple[str, list[str]]:
+    """返回 (最佳局域网 IP, 全部可用候选)。活动网卡优先，其次按私有段打分。
+    候选仅保留标准私有段(192.168/10/172.16-31)，排除 VPN 基准段与 CGNAT。"""
+    active = _active_iface_ipv4s()
+    cands = [ip for ip in _candidate_ipv4s() if _lan_ip_rank(ip) >= 80]
+    cands.sort(key=lambda ip: (ip in active, _lan_ip_rank(ip)), reverse=True)
+    return (cands[0] if cands else ""), cands
+
+
+# 后台周期探测：DHCP 续租/切换网络会让地址变化，页面不能显示旧地址。
+# 同时避免每次 /api/sessions（5s 一次）都 fork 一批 ifconfig/ipconfig 子进程。
+LAN_REFRESH_SEC = 20
+_lan_lock = threading.Lock()
+_lan_cache: dict = {"ip": "", "candidates": [], "ts": 0.0}
+
+
+def _lan_refresh_once() -> None:
+    ip, cands = _probe_lan()
+    with _lan_lock:
+        prev = _lan_cache.get("ip")
+        _lan_cache["ip"] = ip
+        _lan_cache["candidates"] = cands
+        _lan_cache["ts"] = time.time()
+    if ip != prev:
+        sys.stderr.write(f"[lan] 局域网地址变化: {prev or '(空)'} -> {ip or '(空)'}\n")
+
+
+def _lan_refresh_loop() -> None:
+    while True:
+        time.sleep(LAN_REFRESH_SEC)
+        try:
+            _lan_refresh_once()
+        except Exception as e:  # 探测失败不能拖垮服务
+            sys.stderr.write(f"[lan] 探测失败: {e}\n")
+
+
+def start_lan_watcher() -> None:
+    try:
+        _lan_refresh_once()  # 启动即同步探一次，首个请求就有值
+    except Exception as e:
+        sys.stderr.write(f"[lan] 首次探测失败: {e}\n")
+    threading.Thread(target=_lan_refresh_loop, name="lan-watcher", daemon=True).start()
+
+
 def detect_lan_ip() -> str:
-    """返回本机最适合局域网直连的 IPv4;失败返回空串。用于让同网设备低延迟直连。
-    优先标准私有段(192.168/10/172.16-31),排除 VPN 基准段与 CGNAT。"""
-    best = ""
-    best_rank = 0
-    for ip in _candidate_ipv4s():
-        r = _lan_ip_rank(ip)
-        if r > best_rank:
-            best_rank = r
-            best = ip
-    return best
+    """返回缓存的最佳局域网 IPv4（后台每 20s 刷新）；失败返回空串。"""
+    with _lan_lock:
+        ip = _lan_cache.get("ip") or ""
+        ts = float(_lan_cache.get("ts") or 0)
+    if time.time() - ts > LAN_REFRESH_SEC * 3:
+        _lan_refresh_once()  # 兜底：后台线程若异常退出，同步补一次
+        with _lan_lock:
+            ip = _lan_cache.get("ip") or ""
+    return ip
+
+
+def lan_candidates() -> list[str]:
+    with _lan_lock:
+        return list(_lan_cache.get("candidates") or [])
 
 
 MAX_PAGES = 2000  # 上限护栏：避免误填超大值把浏览器内存吃满
@@ -184,6 +262,191 @@ PASTE_MIME_EXT = {
     "image/webp": ".webp",
     "image/gif": ".gif",
 }
+
+# ---- 流量统计 ----
+# 终端页在浏览器侧统计 WebSocket 实际收发字节（这才是真正过网的量），
+# 按 5s 增量上报到此处，按「本地日期 + 会话名」累加落盘。
+TRAFFIC_FILE = ROOT / "run" / "traffic.json"
+TRAFFIC_KEEP_DAYS = 30
+_traffic_lock = threading.Lock()
+
+
+def _today_key() -> str:
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _load_traffic() -> dict:
+    try:
+        raw = json.loads(TRAFFIC_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _prune_traffic(data: dict) -> dict:
+    """只保留最近 TRAFFIC_KEEP_DAYS 天，避免文件无限增长。"""
+    keys = sorted(k for k in data if isinstance(data.get(k), dict))
+    for old in keys[:-TRAFFIC_KEEP_DAYS] if len(keys) > TRAFFIC_KEEP_DAYS else []:
+        data.pop(old, None)
+    return data
+
+
+def add_traffic(name: str, rx: int, tx: int) -> dict:
+    """累加某会话今日流量；返回 {today_rx, today_tx, session_rx, session_tx}。
+    session_* 为该会话跨天累计（所有日期求和），供终端页显示"本会话累计"。"""
+    if rx < 0 or tx < 0:
+        raise ValueError("流量增量不能为负")
+    with _traffic_lock:
+        data = _prune_traffic(_load_traffic())
+        day = data.setdefault(_today_key(), {})
+        if not isinstance(day, dict):
+            day = {}
+            data[_today_key()] = day
+        cur = day.setdefault(name, {"rx": 0, "tx": 0})
+        if not isinstance(cur, dict):
+            cur = {"rx": 0, "tx": 0}
+            day[name] = cur
+        cur["rx"] = int(cur.get("rx", 0)) + rx
+        cur["tx"] = int(cur.get("tx", 0)) + tx
+        try:
+            TRAFFIC_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = TRAFFIC_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(TRAFFIC_FILE)  # 原子替换，避免并发读到半截文件
+        except OSError as e:
+            raise RuntimeError(f"写入流量统计失败: {e}") from e
+        return _summarize(data, name)
+
+
+def _summarize(data: dict, name: str = "") -> dict:
+    day = data.get(_today_key(), {})
+    if not isinstance(day, dict):
+        day = {}
+    today_rx = sum(int(v.get("rx", 0)) for v in day.values() if isinstance(v, dict))
+    today_tx = sum(int(v.get("tx", 0)) for v in day.values() if isinstance(v, dict))
+    s_rx = s_tx = 0
+    if name:
+        for d in data.values():
+            if isinstance(d, dict) and isinstance(d.get(name), dict):
+                s_rx += int(d[name].get("rx", 0))
+                s_tx += int(d[name].get("tx", 0))
+    return {
+        "today_rx": today_rx,
+        "today_tx": today_tx,
+        "today_total": today_rx + today_tx,
+        "session_rx": s_rx,
+        "session_tx": s_tx,
+        "session_total": s_rx + s_tx,
+    }
+
+
+def traffic_summary(name: str = "") -> dict:
+    with _traffic_lock:
+        return _summarize(_load_traffic(), name)
+
+
+# ---- 文件上传 ----
+# 上传落到服务端家目录 ~/Downloads；原始字节流直写，不走 base64（省 33% 膨胀）。
+UPLOAD_DIR = Path.home() / "Downloads"
+UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 单文件 2GB 上限
+UPLOAD_BLOCK = 1024 * 1024
+
+# 危险文件名：路径穿越 / 隐藏文件 / Windows 保留设备名
+_UPLOAD_NAME_BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+_UPLOAD_WIN_DEV = re.compile(
+    r'(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)'
+)
+_UPLOAD_EXT_BLOCK = {
+    ".app", ".dmg", ".pkg", ".command", ".scpt", ".workflow", ".applescript",
+    ".sh", ".bash", ".zsh", ".fish", ".ksh",
+    ".exe", ".msi", ".bat", ".cmd", ".ps1", ".scr", ".vbs", ".js", ".jse",
+    ".wsf", ".wsh", ".hta", ".jar", ".apk",
+}
+_UPLOAD_MAX_PATH = 400  # 落盘相对路径长度上限（macOS APFS 文件名≤255）
+
+
+def _upload_rel_ok(rel: str) -> bool:
+    """校验前端传来的相对路径：仅允许安全子路径，拒绝穿越/绝对路径/隐藏文件。"""
+    if not rel or len(rel) > _UPLOAD_MAX_PATH:
+        return False
+    if rel.startswith("/") or rel.startswith("\\"):
+        return False
+    parts = rel.split("/")
+    for i, p in enumerate(parts):
+        if not p or p in (".", ".."):
+            return False
+        # 非法字符逐段检查（整串查会把合法的 / 分隔符也拦掉）
+        if _UPLOAD_NAME_BAD.search(p):
+            return False
+        if p.startswith(".") and not (i == len(parts) - 1 and p == ".DS_Store"):
+            # 允许 .DS_Store（拖整个文件夹常见）但拒绝其余隐藏文件/目录
+            return False
+        if i == len(parts) - 1:
+            if _UPLOAD_WIN_DEV.match(p):
+                return False
+            ext = ("." + p.rsplit(".", 1)[-1].lower()) if "." in p else ""
+            if ext in _UPLOAD_EXT_BLOCK:
+                return False
+    return True
+
+
+def _unique_dest(dir_path: Path, filename: str) -> Path:
+    """同名不覆盖：name.zip → name (1).zip → name (2).zip …"""
+    dest = dir_path / filename
+    if not dest.exists():
+        return dest
+    stem, dot, ext = filename.rpartition(".")
+    if not dot:
+        stem, ext = filename, ""
+    else:
+        ext = "." + ext
+    for i in range(1, 10000):
+        cand = dir_path / f"{stem} ({i}){ext}"
+        if not cand.exists():
+            return cand
+    raise RuntimeError("同名文件过多，无法生成不冲突的文件名")
+
+
+def save_upload_stream(rel: str, length: int, rfile) -> tuple[Path, int]:
+    """把请求体原始字节流写入 ~/Downloads/<rel>，流式落盘不占内存。
+    返回 (最终路径, 实际字节数)。同名自动改名，绝不覆盖已有文件。"""
+    if not _upload_rel_ok(rel):
+        raise ValueError("不支持的文件名或路径")
+    if length <= 0:
+        raise ValueError("空文件")
+    if length > UPLOAD_MAX_BYTES:
+        raise ValueError(f"单文件超过 {UPLOAD_MAX_BYTES // (1024**3)}GB 上限")
+    dest_dir = UPLOAD_DIR
+    rel_parts = rel.split("/")
+    if len(rel_parts) > 1:
+        dest_dir = UPLOAD_DIR.joinpath(*rel_parts[:-1])
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    # 目标目录不得越过 ~/Downloads（防御纵深，正常到不了这里）
+    real_dl = UPLOAD_DIR.resolve()
+    real_dir = dest_dir.resolve()
+    # 目标目录必须等于 ~/Downloads 本身或位于其内部
+    if real_dir != real_dl and real_dl not in real_dir.parents:
+        raise ValueError("非法的目标目录")
+    dest = _unique_dest(dest_dir, rel_parts[-1])
+    written = 0
+    try:
+        with dest.open("wb") as f:
+            while written < length:
+                chunk = rfile.read(min(UPLOAD_BLOCK, length - written))
+                if not chunk:
+                    break
+                f.write(chunk)
+                written += len(chunk)
+        if written != length:
+            dest.unlink(missing_ok=True)
+            raise ConnectionError(f"上传中断：收到 {written}/{length} 字节")
+    except ValueError:
+        raise
+    except OSError as e:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(f"写入失败: {e}") from e
+    return dest, written
+
 
 MANAGE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -271,6 +534,29 @@ __FAVICON__
   .flash.err { background: rgba(243,18,96,.12); color: #ff8fab; }
   .lanbar { margin: 0 0 14px; padding: 10px 12px; border-radius: 8px; background: rgba(46,160,67,.12); color: #7ee787; font-size: 13px; line-height: 1.6; }
   .lanbar code { background: rgba(0,0,0,.25); padding: 1px 6px; border-radius: 4px; color: #d2e6ff; user-select: all; }
+  .trafficbar {
+    margin: 10px 0 0; font-size: 13px; color: var(--muted);
+    display: flex; gap: 16px; flex-wrap: wrap; align-items: baseline;
+  }
+  .trafficbar b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .trafficbar .sep { color: var(--line); }
+  .updrop {
+    margin: 12px 0 8px; padding: 22px 16px; text-align: center;
+    border: 1.5px dashed var(--line); border-radius: 10px;
+    color: var(--muted); font-size: 13px; transition: border-color .15s, background .15s;
+  }
+  .updrop.over { border-color: var(--accent); background: rgba(61,139,253,.08); color: var(--text); }
+  .upprogress { margin: 10px 0 14px; font-size: 13px; }
+  .upprogress .bar {
+    height: 6px; border-radius: 3px; background: #243041; overflow: hidden; margin: 8px 0 4px;
+  }
+  .upprogress .bar > i {
+    display: block; height: 100%; width: 0;
+    background: var(--accent); transition: width .2s;
+  }
+  .upprogress .item { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .upprogress .done { color: var(--ok); }
+  .upprogress .fail { color: var(--warn); }
   .lanbar .muted { color: var(--muted); }
   .hint { font-size: 12px; color: var(--muted); margin: -4px 0 10px; }
   input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
@@ -321,6 +607,7 @@ __FAVICON__
   <header>
     <h1>会话管理</h1>
     <p class="sub">进入终端需二次验证（24 小时内免重复输入）· 新建使用默认工作目录</p>
+    <div id="trafficBar" class="trafficbar" hidden></div>
   </header>
   <div id="flash" class="flash" hidden></div>
   <div id="lanBar" class="lanbar" hidden></div>
@@ -342,6 +629,23 @@ __FAVICON__
     </div>
     <p class="hint" style="margin-top:8px"><span class="dot green"></span> 可恢复 &nbsp;&nbsp; <span class="dot red"></span> 已断开 &nbsp;&nbsp; 回看列显示「默认 N」= 未单独配置，跟随全局</p>
     <div id="listWrap"><p class="empty">加载中…</p></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2 style="margin:0;font-size:16px">上传到服务器</h2>
+      <div class="actions">
+        <button id="btnUpFile" class="secondary" type="button">选择文件</button>
+        <button id="btnUpDir" class="secondary" type="button">选择文件夹</button>
+      </div>
+    </div>
+    <div id="upDrop" class="updrop">
+      拖放文件或整个文件夹到此处
+      <div class="muted" style="margin-top:4px">保存到服务器 ~/Downloads · 文件夹保留目录结构 · 同名自动加 (n) 后缀</div>
+    </div>
+    <div id="upProgress" class="upprogress" hidden></div>
+    <input id="upFileInput" type="file" multiple hidden>
+    <input id="upDirInput" type="file" webkitdirectory directory multiple hidden>
   </section>
 </main>
 
@@ -394,6 +698,28 @@ let sortDir = 1; // 1 asc, -1 desc
 
 // 局域网直连：若当前不是经 Cloudflare 隧道（公网域名）访问，则没有 /term 路径路由，
 // 需把票据返回的相对 /term/… 改写成 http://<本机>:<ttyd端口>/term/…，延迟更低。
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  const u = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return (n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
+}
+
+function renderTrafficBar() {
+  const el = document.getElementById('trafficBar');
+  if (!el) return;
+  const t = cache && cache.traffic;
+  if (!t) { el.hidden = true; return; }
+  el.innerHTML =
+    '今日总流量 <b>' + esc(fmtBytes(t.today_total)) + '</b>' +
+    '<span class="sep">·</span>下行 <b>' + esc(fmtBytes(t.today_rx)) + '</b>' +
+    '<span class="sep">·</span>上行 <b>' + esc(fmtBytes(t.today_tx)) + '</b>' +
+    '<span class="sep">·</span><span>终端 WebSocket 实际收发，按会话累计</span>';
+  el.hidden = false;
+}
+
 function offTunnel() {
   const pub = cache && cache.public_host;
   return !!pub && location.hostname !== pub;
@@ -772,14 +1098,28 @@ function renderLanBar() {
   const el = document.getElementById('lanBar');
   if (!el) return;
   const lan = cache && cache.lan_ip;
-  const mport = location.port || (location.protocol === 'https:' ? '443' : '80');
+  // 端口必须用服务端真实监听端口：经隧道访问时 location.port 为空（HTTPS 默认 443），
+  // 拿它拼局域网地址会得到 http://<lan>:443 这种打不开的 URL。
+  const mport = (cache && cache.manage_port) || location.port || '7690';
   if (!lan) { el.hidden = true; return; }
   if (offTunnel()) {
     // 已在局域网/本机直连：终端会以 http://<本机>:<ttyd端口> 打开，延迟更低
     el.innerHTML = '局域网直连模式已启用 <span class="muted">· 打开终端将走本机地址，延迟更低</span>';
   } else {
-    // 经公网隧道访问：提示同网设备可换用更快的局域网地址
-    el.innerHTML = '同一局域网内可改用更低延迟的地址访问本页：<code>http://' + esc(lan) + ':' + esc(mport) + '/</code>';
+    // 经公网隧道访问：提示同网设备可换用更快的局域网地址。
+    // 地址由服务端后台每 20s 重新探测，DHCP 续租换 IP 后这里会自动更新。
+    const list = (cache.lan_candidates || []).filter(ip => ip !== lan);
+    let extra = '';
+    if (list.length) {
+      extra = '<div class="muted">备选地址：' +
+        list.map(ip => '<code>http://' + esc(ip) + ':' + esc(mport) + '/</code>').join(' ') +
+        '</div>';
+    }
+    el.innerHTML =
+      '同一局域网内可改用更低延迟的地址访问本页：<code>http://' + esc(lan) + ':' + esc(mport) + '/</code>' +
+      extra +
+      '<div class="muted">连不上？多为访问设备开了代理/VPN（把私有网段也代理走了），' +
+      '或路由器开启了 AP 隔离、两台设备不在同一网段。地址每 20s 自动重新探测。</div>';
   }
   el.hidden = false;
 }
@@ -792,6 +1132,7 @@ async function refresh() {
     if (!alive.has(k)) rowSelected.delete(k);
   }
   renderLanBar();
+  renderTrafficBar();
   paint();
 }
 
@@ -1026,7 +1367,151 @@ document.getElementById('pinModal').addEventListener('click', (ev) => {
 });
 
 refresh().catch(e => flash(String(e.message || e), true));
-setInterval(() => { refresh().catch(() => {}); }, 8000);
+// ---- 文件上传 ----
+// 文件夹/多选拖放统一收集为 {rel, file} 列表，逐个 PUT 原始字节流到 /api/upload。
+// rel 保留目录结构（webkitRelativePath / DataTransferItem.webkitGetAsEntry）。
+(function () {
+  const drop = document.getElementById('upDrop');
+  const prog = document.getElementById('upProgress');
+  const fileInput = document.getElementById('upFileInput');
+  const dirInput = document.getElementById('upDirInput');
+  if (!drop) return;
+
+  let queue = [];      // 待传 {rel, file}
+  let done = 0, failed = 0, totalBytes = 0, sentBytes = 0;
+  let active = false;
+
+  function relOf(file) {
+    // webkitdirectory 时有 webkitRelativePath（含所选文件夹名）
+    return (file.webkitRelativePath || file.name || '').replace(/\\/g, '/');
+  }
+
+  function enqueue(files, label) {
+    const list = [...files].filter(f => f && (f.size >= 0));
+    if (!list.length) return;
+    for (const f of list) queue.push({ rel: relOf(f), file: f });
+    totalBytes += list.reduce((s, f) => s + f.size, 0);
+    flash('');
+    renderProgress(label || null);
+    run();
+  }
+
+  function renderProgress(currentLabel, isError) {
+    if (!queue.length && done + failed === 0) { prog.hidden = true; return; }
+    const pct = totalBytes > 0 ? Math.min(100, Math.round(sentBytes / totalBytes * 100)) : 0;
+    let html = '<b>' + (active ? '上传中 ' : '完成 ') + pct + '%</b>' +
+      ' <span>' + done + ' 个成功' + (failed ? '，<span class="fail">' + failed + ' 个失败</span>' : '') + '</span>' +
+      '<div class="bar"><i style="width:' + pct + '%"></i></div>';
+    if (currentLabel) {
+      html += '<div class="item' + (isError ? ' fail' : '') + '">' + esc(currentLabel) + '</div>';
+    }
+    prog.innerHTML = html;
+    prog.hidden = false;
+  }
+
+  async function run() {
+    if (active) return;
+    active = true;
+    while (queue.length) {
+      const { rel, file } = queue.shift();
+      renderProgress(rel);
+      try {
+        const res = await fetch('/api/upload?rel=' + encodeURIComponent(rel), {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: file,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        sentBytes += file.size;
+        done++;
+        renderProgress(null);
+      } catch (e) {
+        failed++;
+        sentBytes += file.size;
+        renderProgress(rel + ' — ' + (e.message || e), true);
+      }
+    }
+    active = false;
+    if (done + failed > 0) {
+      flash(failed ? '上传完成：' + done + ' 成功，' + failed + ' 失败' : '已上传 ' + done + ' 个文件到 ~/Downloads', !!failed);
+    }
+    // 5 分钟后自动收起进度条
+    setTimeout(() => { if (!active) { prog.hidden = true; done = failed = totalBytes = sentBytes = 0; } }, 5 * 60 * 1000);
+  }
+
+  // ---- 按钮 / input ----
+  document.getElementById('btnUpFile').addEventListener('click', () => fileInput.click());
+  document.getElementById('btnUpDir').addEventListener('click', () => dirInput.click());
+  fileInput.addEventListener('change', () => { enqueue(fileInput.files); fileInput.value = ''; });
+  dirInput.addEventListener('change', () => { enqueue(dirInput.files); dirInput.value = ''; });
+
+  // ---- 拖放：支持文件、文件夹（webkitGetAsEntry 递归） ----
+  ['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    drop.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach(t => drop.addEventListener(t, ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    drop.classList.remove('over');
+  }));
+
+  function walkEntry(entry, base, out) {
+    return new Promise(resolve => {
+      if (!entry) return resolve();
+      if (entry.isFile) {
+        entry.file(f => {
+          out.push({ rel: (base ? base + '/' : '') + f.name, file: f });
+          resolve();
+        }, () => resolve());
+      } else if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const readBatch = () => reader.readEntries(async entries => {
+          if (!entries.length) return resolve();
+          for (const e of entries) await walkEntry(e, (base ? base + '/' : '') + entry.name, out);
+          readBatch(); // 目录条目超过 100 个时分批读
+        }, () => resolve());
+        readBatch();
+      } else resolve();
+    });
+  }
+
+  drop.addEventListener('drop', async ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    const items = ev.dataTransfer && ev.dataTransfer.items;
+    if (!items || !items.length) return;
+    // Chrome/Edge/Safari 支持目录拖入；Firefox 走 files 兜底
+    if (items[0].webkitGetAsEntry) {
+      const out = [];
+      const entries = [];
+      for (const it of items) {
+        const e = it.webkitGetAsEntry && it.webkitGetAsEntry();
+        if (e) entries.push(e);
+      }
+      if (entries.length) {
+        for (const e of entries) await walkEntry(e, '', out);
+        if (out.length) {
+          totalBytes += out.reduce((s, x) => s + x.file.size, 0);
+          queue.push(...out);
+          renderProgress(null);
+          run();
+        }
+        return;
+      }
+    }
+    if (ev.dataTransfer.files && ev.dataTransfer.files.length) enqueue(ev.dataTransfer.files);
+  });
+})();
+
+// 省流量：标签页不可见时停止轮询；切回前台立即刷新一次，体验不变。
+setInterval(() => {
+  if (document.hidden) return;
+  refresh().catch(() => {});
+}, 5000);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refresh().catch(() => {});
+});
 </script>
 </body>
 </html>
@@ -1544,9 +2029,12 @@ class Handler(BaseHTTPRequestHandler):
                     "env_default_pages": _env_default_pages(),
                     "max_pages": MAX_PAGES,
                     "lan_ip": detect_lan_ip(),
+                    "lan_candidates": lan_candidates(),
                     "ttyd_port": TTYD_PORT,
+                    "manage_port": MANAGE_PORT,
                     "term_base": TTYD_BASE_PATH + "/",
                     "public_host": PUBLIC_HOST,
+                    "traffic": traffic_summary(),
                 },
             )
             return
@@ -1584,18 +2072,54 @@ class Handler(BaseHTTPRequestHandler):
                     "default_pages": default_pages(),
                     "lan_ip": detect_lan_ip(),
                     "ttyd_port": TTYD_PORT,
+                    "manage_port": MANAGE_PORT,
                 },
             )
+            return
+        if path == "/api/traffic":
+            qs = parse_qs(parsed.query)
+            name = (qs.get("name") or [""])[0].strip()
+            self._json(200, traffic_summary(name), self._lan_cors_headers())
             return
         if path == "/api/unlock":
             self._json(200, {"ok": self._has_valid_unlock()})
             return
         self._json(404, {"error": "not found"})
 
+    def _handle_upload(self) -> None:
+        """POST /api/upload?rel=<相对路径>  请求体=原始文件字节流。
+        文件夹上传由前端拆成多个请求逐文件发送，rel 保留目录结构。"""
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        rel = unquote((qs.get("rel") or [""])[0]).strip()
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            self._json(400, {"error": "无效的 Content-Length"})
+            return
+        try:
+            dest, written = save_upload_stream(rel, length, self.rfile)
+        except ValueError as e:
+            self._json(400, {"error": str(e)})
+            return
+        except ConnectionError as e:
+            self._json(400, {"error": str(e)})
+            return
+        except RuntimeError as e:
+            self._json(500, {"error": str(e)})
+            return
+        rel_out = str(dest.relative_to(UPLOAD_DIR))
+        sys.stderr.write(f"[upload] {rel_out} ({written} bytes)\n")
+        self._json(200, {"ok": True, "path": str(dest), "rel": rel_out, "bytes": written})
+
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
-        if path == "/api/paste-image":
+        # 文件上传：请求体是原始字节流，必须在此分流，不能走下面的 JSON 解析
+        if path == "/api/upload":
+            self._handle_upload()
+            return
+        if path in ("/api/paste-image", "/api/traffic"):
             if not self._check_auth_or_unlock():
                 return
         elif not self._check_auth():
@@ -1700,6 +2224,33 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/traffic":
+            cors = self._lan_cors_headers()
+            name = str(data.get("name") or "").strip()
+            if not NAME_RE.match(name):
+                self._json(400, {"error": "无效会话名"}, cors)
+                return
+            try:
+                rx = int(data.get("rx") or 0)
+                tx = int(data.get("tx") or 0)
+            except (TypeError, ValueError):
+                self._json(400, {"error": "rx/tx 必须是整数"}, cors)
+                return
+            # 单次上报上限护栏：5s 内不可能超过 512MB，异常值直接拒绝防污染统计
+            if rx < 0 or tx < 0 or rx > 512 * 1024 * 1024 or tx > 512 * 1024 * 1024:
+                self._json(400, {"error": "流量增量超出合理范围"}, cors)
+                return
+            try:
+                summary = add_traffic(name, rx, tx)
+            except ValueError as e:
+                self._json(400, {"error": str(e)}, cors)
+                return
+            except RuntimeError as e:
+                self._json(500, {"error": str(e)}, cors)
+                return
+            self._json(200, {"ok": True, **summary}, cors)
+            return
+
         if path == "/api/paste-image":
             cors = self._lan_cors_headers()
             mime = str(data.get("mime") or "image/png")
@@ -1788,8 +2339,10 @@ def main() -> None:
     except ValueError as e:
         raise SystemExit(f".env 配置错误: {e}") from e
     httpd = ThreadingHTTPServer((MANAGE_HOST, MANAGE_PORT), Handler)
+    start_lan_watcher()  # 后台每 20s 刷新局域网地址，避免页面显示过期 IP
     print(f"manage listening on http://{MANAGE_HOST}:{MANAGE_PORT}", flush=True)
     print(f"path_root={PATH_ROOT} default_path={DEFAULT_PATH}", flush=True)
+    print(f"lan_ip={detect_lan_ip() or '(未探测到)'}", flush=True)
     httpd.serve_forever()
 
 
