@@ -445,7 +445,160 @@ def save_upload_stream(rel: str, length: int, rfile) -> tuple[Path, int]:
     except OSError as e:
         dest.unlink(missing_ok=True)
         raise RuntimeError(f"写入失败: {e}") from e
+    record_upload(dest, written)
     return dest, written
+
+
+def overwrite_upload_stream(rel: str, length: int, rfile) -> tuple[Path, int]:
+    """覆盖写入 ~/Downloads/<rel>（重新上传历史文件）。同名直接覆盖，不改名。
+    先写临时文件再原子替换：中途失败不会把原文件写坏。"""
+    if not _upload_rel_ok(rel):
+        raise ValueError("不支持的文件名或路径")
+    if length <= 0:
+        raise ValueError("空文件")
+    if length > UPLOAD_MAX_BYTES:
+        raise ValueError(f"单文件超过 {UPLOAD_MAX_BYTES // (1024**3)}GB 上限")
+    dest = _resolve_upload_rel(rel)
+    if not dest.exists():
+        raise ValueError("目标文件不存在（可能已被删除），请重新上传")
+    if dest.is_dir():
+        raise ValueError("目标是目录，不能覆盖")
+    tmp = dest.with_name(dest.name + ".wt-tmp")
+    written = 0
+    try:
+        with tmp.open("wb") as f:
+            while written < length:
+                chunk = rfile.read(min(UPLOAD_BLOCK, length - written))
+                if not chunk:
+                    break
+                f.write(chunk)
+                written += len(chunk)
+        if written != length:
+            raise ConnectionError(f"上传中断：收到 {written}/{length} 字节")
+        os.replace(tmp, dest)  # 原子替换，旧版本被完整覆盖
+    except ValueError:
+        tmp.unlink(missing_ok=True)
+        raise
+    except (ConnectionError, OSError) as e:
+        tmp.unlink(missing_ok=True)
+        if isinstance(e, ConnectionError):
+            raise
+        raise RuntimeError(f"写入失败: {e}") from e
+    record_upload(dest, written)
+    return dest, written
+
+
+# ---- 上传历史：保留最近 10 条，供复制服务器全路径 ----
+UPLOAD_HISTORY_FILE = ROOT / "run" / "upload-history.json"
+UPLOAD_HISTORY_KEEP = 10
+_upload_hist_lock = threading.Lock()
+
+
+def load_upload_history() -> list[dict]:
+    try:
+        raw = json.loads(UPLOAD_HISTORY_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def new_upload_batch_dir() -> Path:
+    """每次上传批次新建独立子目录 ~/Downloads/上传_<时间戳>。
+    解压/整理只影响本批文件，不污染 Downloads 其它内容。
+    用服务端时钟命名（客户端时间不可信）；同一秒多批自动加 -2/-3 序号。"""
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    for i in range(100):
+        name = f"上传_{stamp}" if i == 0 else f"上传_{stamp}-{i}"
+        d = UPLOAD_DIR / name
+        try:
+            d.mkdir(parents=True, exist_ok=False)
+            return d
+        except FileExistsError:
+            continue
+    raise RuntimeError("无法创建上传目录")
+
+
+def record_upload(dest: Path, size: int) -> None:
+    """追加一条上传记录，只保留最近 KEEP 条。失败不影响上传结果。"""
+    item = {
+        "path": str(dest),
+        "rel": dest.name,
+        "bytes": size,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    }
+    try:
+        with _upload_hist_lock:
+            hist = load_upload_history()
+            hist.append(item)
+            UPLOAD_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = UPLOAD_HISTORY_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(hist[-UPLOAD_HISTORY_KEEP:], ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(UPLOAD_HISTORY_FILE)  # 原子替换
+    except OSError as e:
+        sys.stderr.write(f"[upload] 记录历史失败(不影响文件): {e}\n")
+
+
+def prune_upload_history() -> list[dict]:
+    """清理不存在于磁盘的记录，供前端展示前调用。"""
+    with _upload_hist_lock:
+        hist = load_upload_history()
+        kept = [h for h in hist if Path(h.get("path", "")).exists()]
+        if len(kept) != len(hist):
+            try:
+                UPLOAD_HISTORY_FILE.write_text(
+                    json.dumps(kept[-UPLOAD_HISTORY_KEEP:], ensure_ascii=False, indent=1),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+        return kept[-UPLOAD_HISTORY_KEEP:]
+
+
+def _resolve_upload_rel(rel: str) -> Path:
+    """把历史记录里的相对路径安全解析到 ~/Downloads 内的绝对路径。
+    复用上传的路径校验（拒绝穿越/绝对路径/隐藏文件），并二次确认
+    解析结果确实位于 Downloads 内（防 symlink 逃逸）。"""
+    if not _upload_rel_ok(rel):
+        raise ValueError("不支持的文件名或路径")
+    dest = UPLOAD_DIR.joinpath(*rel.split("/"))
+    real_dl = UPLOAD_DIR.resolve()
+    real_dest = dest.resolve(strict=False)
+    if real_dest != real_dl and real_dl not in real_dest.parents:
+        raise ValueError("非法的目标路径")
+    return dest
+
+
+def remove_upload_file(path: str) -> dict:
+    """删除上传历史对应的文件（仅限 Downloads 内），同步清理历史记录。"""
+    try:
+        rel = str(Path(path).resolve().relative_to(UPLOAD_DIR.resolve()))
+    except ValueError:
+        raise ValueError("只能删除 Downloads 内的文件")
+    dest = _resolve_upload_rel(rel)
+    if not dest.exists():
+        _prune_hist_record(str(dest))
+        return {"ok": True, "already_gone": True, "rel": rel}
+    if dest.is_dir():
+        raise ValueError("是目录不是文件，请手动删除")
+    dest.unlink()
+    _prune_hist_record(str(dest))
+    sys.stderr.write(f"[upload] deleted {rel}\n")
+    return {"ok": True, "rel": rel}
+
+
+def _prune_hist_record(abs_path: str) -> None:
+    """从上传历史里移除一条记录（按绝对路径匹配）。"""
+    with _upload_hist_lock:
+        hist = load_upload_history()
+        kept = [h for h in hist if h.get("path") != abs_path]
+        if len(kept) != len(hist):
+            try:
+                UPLOAD_HISTORY_FILE.write_text(
+                    json.dumps(kept[-UPLOAD_HISTORY_KEEP:], ensure_ascii=False, indent=1),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
 
 
 MANAGE_HTML = r"""<!DOCTYPE html>
@@ -557,6 +710,35 @@ __FAVICON__
   .upprogress .item { color: var(--muted); font-size: 12px; word-break: break-all; }
   .upprogress .done { color: var(--ok); }
   .upprogress .fail { color: var(--warn); }
+  .uphistory { margin: 4px 0 8px; }
+  .uphistory h3 {
+    margin: 10px 0 6px; font-size: 12px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600;
+  }
+  .uphistory ul { list-style: none; margin: 0; padding: 0; }
+  .uphistory li {
+    display: flex; gap: 8px; align-items: center;
+    padding: 6px 8px; border-radius: 8px; font-size: 13px;
+  }
+  .uphistory li:hover { background: rgba(255,255,255,.03); }
+  .uphistory .fname {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  }
+  .uphistory .fmeta { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .uphistory .cp {
+    appearance: none; border: 0; cursor: pointer; border-radius: 6px;
+    padding: 4px 10px; font-size: 12px; background: #2b3645; color: var(--text);
+  }
+  .uphistory .cp:hover { background: var(--accent); }
+  .uphistory .cp.ok { background: rgba(61,214,140,.2); color: var(--ok); }
+  .uphistory button.op {
+    appearance: none; border: 0; cursor: pointer; border-radius: 6px;
+    padding: 4px 10px; font-size: 12px; background: #2b3645; color: var(--text);
+  }
+  .uphistory button.op:hover:not(:disabled) { background: var(--accent); }
+  .uphistory button.op:disabled { opacity: .5; cursor: default; }
+  .uphistory button.op.del:hover:not(:disabled) { background: var(--danger); }
   .lanbar .muted { color: var(--muted); }
   .hint { font-size: 12px; color: var(--muted); margin: -4px 0 10px; }
   input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
@@ -641,9 +823,10 @@ __FAVICON__
     </div>
     <div id="upDrop" class="updrop">
       拖放文件或整个文件夹到此处
-      <div class="muted" style="margin-top:4px">保存到服务器 ~/Downloads · 文件夹保留目录结构 · 同名自动加 (n) 后缀</div>
+      <div class="muted" style="margin-top:4px">每批自动新建 ~/Downloads/上传_日期-time 子文件夹 · 文件夹保留目录结构 · 互不影响其它文件</div>
     </div>
     <div id="upProgress" class="upprogress" hidden></div>
+    <div id="upHistory" class="uphistory" hidden></div>
     <input id="upFileInput" type="file" multiple hidden>
     <input id="upDirInput" type="file" webkitdirectory directory multiple hidden>
   </section>
@@ -1381,6 +1564,152 @@ refresh().catch(e => flash(String(e.message || e), true));
   let done = 0, failed = 0, totalBytes = 0, sentBytes = 0;
   let active = false;
 
+  // ---- 上传历史：最近 10 条，一键复制服务器全路径 ----
+  const histEl = document.getElementById('upHistory');
+
+  function fmtSize(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + ' B';
+    const u = ['KB', 'MB', 'GB', 'TB'];
+    let i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+    return (n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
+  }
+
+  function renderHistory(list) {
+    if (!histEl) return;
+    if (!list || !list.length) { histEl.hidden = true; histEl.innerHTML = ''; return; }
+    let html = '<h3>最近上传 · 点击文件名复制服务器路径</h3><ul>';
+    const sorted = list.slice().sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')));
+    for (const h of sorted) {
+      const rel = h.rel || (h.path || '').split('/').pop() || '';
+      html += '<li data-rel="' + esc(rel) + '" data-path="' + esc(h.path || '') + '">' +
+        '<span class="fname" title="' + esc(h.path) + '">' + esc(h.path) + '</span>' +
+        '<span class="fmeta">' + esc(fmtSize(h.bytes)) + ' · ' + esc(h.ts || '') + '</span>' +
+        '<button type="button" class="cp" data-path="' + esc(h.path) + '">复制路径</button>' +
+        '<button type="button" class="op" data-act="download" title="下载到本机">下载</button>' +
+        '<button type="button" class="op" data-act="overwrite" title="选择本机文件重新上传，覆盖服务器上的同名文件">重新上传</button>' +
+        '<button type="button" class="op del" data-act="delete" title="删除服务器上的这个文件">删除</button>' +
+        '</li>';
+    }
+    html += '</ul>';
+    histEl.innerHTML = html;
+    histEl.hidden = false;
+    histEl.querySelectorAll('.cp').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const p = btn.getAttribute('data-path') || '';
+        let oked = false;
+        try {
+          await navigator.clipboard.writeText(p);
+          oked = true;
+        } catch (e) {
+          // clipboard API 不可用（如非安全上下文）时用 execCommand 兜底
+          try {
+            const ta = document.createElement('textarea');
+            ta.value = p;
+            ta.style.cssText = 'position:fixed;opacity:0;';
+            document.body.appendChild(ta);
+            ta.select();
+            oked = document.execCommand('copy');
+            ta.remove();
+          } catch (e2) { oked = false; }
+        }
+        btn.textContent = oked ? '✓ 已复制' : '复制失败';
+        btn.classList.add('ok');
+        setTimeout(() => { btn.textContent = '复制路径'; btn.classList.remove('ok'); }, 1600);
+      });
+    });
+    // 三个文件操作：下载 / 覆盖（重新上传） / 删除
+    histEl.querySelectorAll('button.op').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const li = btn.closest('li');
+        const act = btn.getAttribute('data-act');
+        const rel = li ? li.getAttribute('data-rel') || '' : '';
+        const path = li ? li.getAttribute('data-path') || '' : '';
+        if (!rel || !path) return;
+        if (act === 'download') {
+          // 同源 fetch 带 Basic Auth（浏览器已缓存凭据），blob 触发保存
+          btn.disabled = true; btn.textContent = '…';
+          try {
+            const res = await fetch('/api/upload-download?rel=' + encodeURIComponent(rel), { credentials: 'same-origin' });
+            if (!res.ok) {
+              let msg = 'HTTP ' + res.status;
+              try { msg = (await res.json()).error || msg; } catch (e) {}
+              throw new Error(msg);
+            }
+            const blob = await res.blob();
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = rel.split('/').pop() || 'download';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+            flash('已开始下载 ' + rel.split('/').pop());
+          } catch (e) {
+            flash('下载失败: ' + (e.message || e), true);
+          }
+          btn.disabled = false; btn.textContent = '下载';
+          return;
+        }
+        if (act === 'overwrite') {
+          // 弹文件选择器 → 选中后直接覆盖写回服务器同一路径
+          const input = document.createElement('input');
+          input.type = 'file';
+          input.addEventListener('change', async () => {
+            const f = input.files && input.files[0];
+            if (!f) return;
+            if (!confirm('用「' + f.name + '」覆盖服务器上的 ' + rel + ' ？')) { input.value = ''; return; }
+            btn.disabled = true; btn.textContent = '…';
+            try {
+              const d = await api('/api/upload?rel=' + encodeURIComponent(rel) + '&overwrite=1', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/octet-stream' },
+                body: f,
+              });
+              flash('已覆盖 ' + rel + '（' + fmtSize(d.bytes || f.size) + '）');
+              updateHistoryFrom(d);
+            } catch (e) {
+              flash('覆盖失败: ' + (e.message || e), true);
+            }
+            btn.disabled = false; btn.textContent = '重新上传';
+          });
+          input.click();
+          return;
+        }
+        if (act === 'delete') {
+          if (!confirm('删除服务器上的 ' + path + ' ？此操作不可恢复。')) return;
+          btn.disabled = true; btn.textContent = '…';
+          try {
+            const d = await api('/api/upload-delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: path }),
+            });
+            flash(d.already_gone ? '文件已不存在，已清理历史记录' : '已删除 ' + rel);
+            updateHistoryFrom(d);
+          } catch (e) {
+            flash('删除失败: ' + (e.message || e), true);
+          }
+          btn.disabled = false; btn.textContent = '删除';
+          return;
+        }
+      });
+    });
+  }
+
+  async function loadHistory() {
+    try {
+      const d = await api('/api/upload-history');
+      renderHistory(d.history || []);
+    } catch (e) { /* 历史加载失败不提示 */ }
+  }
+
+  function updateHistoryFrom(respData) {
+    if (respData && Array.isArray(respData.history)) renderHistory(respData.history);
+    else loadHistory();
+  }
+
   function relOf(file) {
     // webkitdirectory 时有 webkitRelativePath（含所选文件夹名）
     return (file.webkitRelativePath || file.name || '').replace(/\\/g, '/');
@@ -1412,8 +1741,20 @@ refresh().catch(e => flash(String(e.message || e), true));
   async function run() {
     if (active) return;
     active = true;
+    // 每批上传先向服务端要一个独立子目录（服务端时钟命名），全部文件进同一目录，
+    // 解压/整理互不影响 Downloads 其它内容
+    let batch = '';
+    try {
+      const d = await api('/api/upload-batch', { method: 'POST' });
+      batch = d.dir ? d.dir + '/' : '';
+    } catch (e) {
+      batch = ''; // 建目录失败则退回 Downloads 根，不阻断上传
+    }
+    if (batch) renderProgress('→ ' + batch);
     while (queue.length) {
-      const { rel, file } = queue.shift();
+      const item = queue.shift();
+      const rel = batch + item.rel;
+      const file = item.file;
       renderProgress(rel);
       try {
         const res = await fetch('/api/upload?rel=' + encodeURIComponent(rel), {
@@ -1427,6 +1768,7 @@ refresh().catch(e => flash(String(e.message || e), true));
         sentBytes += file.size;
         done++;
         renderProgress(null);
+        updateHistoryFrom(data);  // 响应直接带最新历史，免一次额外请求
       } catch (e) {
         failed++;
         sentBytes += file.size;
@@ -1435,7 +1777,7 @@ refresh().catch(e => flash(String(e.message || e), true));
     }
     active = false;
     if (done + failed > 0) {
-      flash(failed ? '上传完成：' + done + ' 成功，' + failed + ' 失败' : '已上传 ' + done + ' 个文件到 ~/Downloads', !!failed);
+      flash(failed ? '上传完成：' + done + ' 成功，' + failed + ' 失败' : '已上传 ' + done + ' 个文件到 ' + (batch ? '~/Downloads/' + batch : '~/Downloads'), !!failed);
     }
     // 5 分钟后自动收起进度条
     setTimeout(() => { if (!active) { prog.hidden = true; done = failed = totalBytes = sentBytes = 0; } }, 5 * 60 * 1000);
@@ -1502,6 +1844,8 @@ refresh().catch(e => flash(String(e.message || e), true));
     }
     if (ev.dataTransfer.files && ev.dataTransfer.files.length) enqueue(ev.dataTransfer.files);
   });
+
+  loadHistory();  // 页面加载即显示最近上传
 })();
 
 // 省流量：标签页不可见时停止轮询；切回前台立即刷新一次，体验不变。
@@ -2081,24 +2425,68 @@ class Handler(BaseHTTPRequestHandler):
             name = (qs.get("name") or [""])[0].strip()
             self._json(200, traffic_summary(name), self._lan_cors_headers())
             return
+        if path == "/api/upload-history":
+            self._json(200, {"history": prune_upload_history()})
+            return
+        if path == "/api/upload-download":
+            qs = parse_qs(parsed.query)
+            rel = unquote((qs.get("rel") or [""])[0]).strip()
+            try:
+                dest = _resolve_upload_rel(rel)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            if not dest.is_file():
+                self._json(404, {"error": "文件不存在"})
+                return
+            try:
+                size = dest.stat().st_size
+            except OSError as e:
+                self._json(500, {"error": str(e)})
+                return
+            # RFC 6266：文件名带非 ASCII 时用 filename*，中英文文件名都能正确落地
+            quoted = quote(dest.name)
+            body = b""  # 流式发送，不整读进内存（大文件）
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                with dest.open("rb") as f:
+                    while True:
+                        chunk = f.read(UPLOAD_BLOCK)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # 客户端取消下载
+            sys.stderr.write(f"[upload] download {rel} ({size} bytes)\n")
+            return
         if path == "/api/unlock":
             self._json(200, {"ok": self._has_valid_unlock()})
             return
         self._json(404, {"error": "not found"})
 
     def _handle_upload(self) -> None:
-        """POST /api/upload?rel=<相对路径>  请求体=原始文件字节流。
-        文件夹上传由前端拆成多个请求逐文件发送，rel 保留目录结构。"""
+        """POST /api/upload?rel=<相对路径>&overwrite=1  请求体=原始文件字节流。
+        文件夹上传由前端拆成多个请求逐文件发送，rel 保留目录结构。
+        默认同名自动改名不覆盖；overwrite=1 时覆盖历史记录指向的既有文件。"""
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         rel = unquote((qs.get("rel") or [""])[0]).strip()
+        overwrite = (qs.get("overwrite") or [""])[0] in ("1", "true", "yes")
         try:
             length = int(self.headers.get("Content-Length", "0") or 0)
         except ValueError:
             self._json(400, {"error": "无效的 Content-Length"})
             return
         try:
-            dest, written = save_upload_stream(rel, length, self.rfile)
+            if overwrite:
+                dest, written = overwrite_upload_stream(rel, length, self.rfile)
+            else:
+                dest, written = save_upload_stream(rel, length, self.rfile)
         except ValueError as e:
             self._json(400, {"error": str(e)})
             return
@@ -2110,7 +2498,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         rel_out = str(dest.relative_to(UPLOAD_DIR))
         sys.stderr.write(f"[upload] {rel_out} ({written} bytes)\n")
-        self._json(200, {"ok": True, "path": str(dest), "rel": rel_out, "bytes": written})
+        self._json(200, {"ok": True, "path": str(dest), "rel": rel_out, "bytes": written, "history": prune_upload_history()})
+
+    def _handle_batch(self) -> None:
+        """POST /api/upload-batch：为一批上传创建独立子目录，返回相对目录名。"""
+        try:
+            d = new_upload_batch_dir()
+        except (OSError, RuntimeError) as e:
+            self._json(500, {"error": str(e)})
+            return
+        sys.stderr.write(f"[upload] batch dir {d.name}\n")
+        self._json(200, {"ok": True, "dir": d.name, "path": str(d)})
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -2118,6 +2516,11 @@ class Handler(BaseHTTPRequestHandler):
         # 文件上传：请求体是原始字节流，必须在此分流，不能走下面的 JSON 解析
         if path == "/api/upload":
             self._handle_upload()
+            return
+        if path == "/api/upload-batch":
+            if not self._check_auth():
+                return
+            self._handle_batch()
             return
         if path in ("/api/paste-image", "/api/traffic"):
             if not self._check_auth_or_unlock():
@@ -2130,6 +2533,22 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8") or "{}")
         except json.JSONDecodeError:
             data = {}
+
+        if path == "/api/upload-delete":
+            p = str(data.get("path") or "").strip()
+            if not p:
+                self._json(400, {"error": "缺少 path"})
+                return
+            try:
+                result = remove_upload_file(p)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            except OSError as e:
+                self._json(500, {"error": str(e)})
+                return
+            self._json(200, {"history": prune_upload_history(), **result})
+            return
 
         if path == "/api/ticket":
             pin = str(data.get("pin") or "")
