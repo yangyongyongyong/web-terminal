@@ -30,6 +30,16 @@
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
   <key>StandardOutPath</key>
   <string>/Users/thomas990p/web-terminal/logs/ttyd.log</string>
   <key>StandardErrorPath</key>

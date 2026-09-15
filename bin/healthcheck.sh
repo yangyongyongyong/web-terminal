@@ -51,6 +51,28 @@ restart_service() {
   pkill -f "${pattern}" 2>>"${LOG}" || true
 }
 
+# 只处理"自上次检查点之后"新增的日志行，避免历史遗留的错误行反复触发重启。
+new_log_lines_since_checkpoint() {
+  local logfile="$1"
+  local checkpoint_file="$2"
+  local total_lines last_pos
+  total_lines="$(wc -l <"${logfile}" 2>/dev/null | tr -dc '0-9')"
+  total_lines="${total_lines:-0}"
+  last_pos="0"
+  if [[ -f "${checkpoint_file}" ]]; then
+    last_pos="$(cat "${checkpoint_file}" 2>/dev/null | tr -dc '0-9')"
+    last_pos="${last_pos:-0}"
+  fi
+  if [[ "${total_lines}" -lt "${last_pos}" ]]; then
+    # 日志被截断/轮转过，从头算
+    last_pos=0
+  fi
+  echo "${total_lines}" >"${checkpoint_file}"
+  if [[ "${total_lines}" -gt "${last_pos}" ]]; then
+    tail -n "$((total_lines - last_pos))" "${logfile}" 2>/dev/null
+  fi
+}
+
 # manage 挂了就拉起（不影响已有 tmux）
 if ! curl -s -o /dev/null --connect-timeout 2 --max-time 3 -u "${TTYD_USER}:${TTYD_PASSWORD}" "${MANAGE}"; then
   log "manage down → restart manage"
@@ -65,6 +87,36 @@ if ! curl -s -o /dev/null --connect-timeout 2 --max-time 3 "${ORIGIN}"; then
     restart_service "uk.lucadesign.web-terminal.ttyd" '/Users/thomas990p/web-terminal/bin/run-ttyd.sh'
     sleep 2
   fi
+fi
+
+# ttyd fd 泄漏检测：pty_spawn 失败（fd 耗尽）会导致前端一直重连刷新。
+# 只看"自上次检查点之后新增"的 "Too many open files" 次数（避免历史行反复触发），
+# 再叠加当前进程打开的 ptmx fd 数作为信号，达到阈值就主动重启 ttyd
+# （不影响已保留的 tmux 会话，会话数据在独立 tmux server 里）。
+TTYD_LOG_FILE="${ROOT}/logs/ttyd.log"
+TTYD_LOG_CHECKPOINT="${ROOT}/run/ttyd-log-checkpoint"
+TTYD_PID="$(pgrep -f '^/opt/homebrew/bin/ttyd .*run-ttyd|bin/ttyd --interface' 2>/dev/null | head -1)"
+if [[ -z "${TTYD_PID}" ]]; then
+  TTYD_PID="$(pgrep -x ttyd 2>/dev/null | head -1)"
+fi
+
+new_fd_errors=0
+if [[ -f "${TTYD_LOG_FILE}" ]]; then
+  new_fd_errors="$(new_log_lines_since_checkpoint "${TTYD_LOG_FILE}" "${TTYD_LOG_CHECKPOINT}" | grep -c 'Too many open files' || true)"
+fi
+
+open_ptmx=0
+if [[ -n "${TTYD_PID}" ]]; then
+  open_ptmx="$(lsof -p "${TTYD_PID}" 2>/dev/null | grep -c '/dev/ptmx' || true)"
+fi
+
+FD_ERROR_THRESHOLD=1
+PTMX_THRESHOLD=180
+
+if [[ "${new_fd_errors}" -ge "${FD_ERROR_THRESHOLD}" || "${open_ptmx}" -ge "${PTMX_THRESHOLD}" ]]; then
+  log "ttyd fd leak suspected (new_fd_errors=${new_fd_errors}, open_ptmx=${open_ptmx}, pid=${TTYD_PID}) → restart ttyd"
+  restart_service "uk.lucadesign.web-terminal.ttyd" '/Users/thomas990p/web-terminal/bin/run-ttyd.sh'
+  sleep 2
 fi
 
 ready_json="$(curl -s --connect-timeout 2 --max-time 3 "${METRICS_READY}" 2>/dev/null || true)"
