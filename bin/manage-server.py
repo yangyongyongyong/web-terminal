@@ -601,6 +601,128 @@ def _prune_hist_record(abs_path: str) -> None:
                 pass
 
 
+# ---- 服务端文件浏览 / 预览 / 下载 ----
+# 浏览范围由 FS_PATH_ROOT 单独控制（默认 /，即全盘；可收紧到某个子目录），
+# 与 SESSION_PATH_ROOT（限制新建会话工作目录）互不影响。
+# 所有入口都先过 _fs_resolve：resolve 后必须仍在根内，防穿越/symlink 逃逸。
+FS_ROOT = Path(str(ENV.get("FS_PATH_ROOT") or "/")).expanduser().resolve()
+FS_LIST_MAX = 2000          # 单目录最多列出条目
+FS_TEXT_MAX = 2 * 1024 * 1024   # 文本预览上限 2MB
+FS_IMAGE_MAX = 64 * 1024 * 1024 # 图片预览/下载上限 64MB
+FS_DOWNLOAD_MAX = 2 * 1024 ** 3 # 下载上限 2GB（流式）
+
+_FS_TEXT_EXT = {
+    ".txt", ".md", ".markdown", ".log", ".json", ".yaml", ".yml", ".toml",
+    ".ini", ".cfg", ".conf", ".env", ".csv", ".tsv",
+    ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".vue", ".svelte",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".java", ".kt", ".kts", ".go", ".rs",
+    ".rb", ".php", ".swift", ".m", ".mm", ".sh", ".bash", ".zsh", ".fish",
+    ".sql", ".html", ".htm", ".css", ".scss", ".less", ".xml", ".svg",
+    ".gitignore", ".gitattributes", ".dockerfile", ".makefile", ".cmake",
+}
+_FS_TEXT_NAMES = {"Makefile", "Dockerfile", "LICENSE", "README", "CHANGELOG", ".gitignore", ".env"}
+_FS_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".avif"}
+
+
+def _fs_resolve(rel: str) -> Path:
+    """把 URL 里的相对路径安全解析到根内绝对路径。空串=根目录。
+    拒绝绝对路径；resolve 后必须位于根内（防 ../ 穿越 与 symlink 逃逸）。"""
+    rel = (rel or "").strip().lstrip("/")
+    if len(rel) > 1024:
+        raise ValueError("路径过长")
+    if rel.startswith("\\") or "\x00" in rel:
+        raise ValueError("非法路径")
+    p = FS_ROOT.joinpath(*[seg for seg in rel.split("/") if seg and seg != "."]) if rel else FS_ROOT
+    real = p.resolve(strict=False)
+    if real != FS_ROOT and FS_ROOT not in real.parents:
+        raise ValueError("路径越界")
+    return real
+
+
+def _fs_rel_from_abs(user_input: str) -> str:
+    """用户输入的绝对路径 → 根内相对路径（供跳转）。
+    接受三种：绝对路径（必须在根内）、~/ 开头、已是相对路径。
+    用 os.path.normpath 消化冗余段后统一走 _fs_resolve 的根内校验。"""
+    s = (user_input or "").strip()
+    if not s:
+        return ""
+    if s.startswith("~/"):
+        s = str(Path.home() / s[2:])
+    if s.startswith("/"):
+        try:
+            abs_p = Path(os.path.normpath(s)).resolve(strict=False)
+        except OSError as e:
+            raise ValueError(f"无效路径: {e}")
+        root = FS_ROOT
+        if abs_p == root or root in abs_p.parents:
+            rel = str(abs_p.relative_to(root))
+            return "" if rel == "." else rel
+        raise ValueError("路径不在可浏览范围内（" + str(root) + " 内）")
+    # 相对路径：交给 _fs_resolve 校验（含 ../ 穿越拦截）
+    real = _fs_resolve(s)
+    return str(real.relative_to(FS_ROOT)) if real != FS_ROOT else ""
+
+
+def _fs_kind(p: Path) -> str:
+    name = p.name.lower()
+    ext = p.suffix.lower()
+    if ext in _FS_IMAGE_EXT:
+        return "image"
+    if ext in _FS_TEXT_EXT or name in _FS_TEXT_NAMES or (not ext and name.startswith(".")):
+        return "text"
+    return "binary"
+
+
+def fs_list(rel: str) -> dict:
+    """列目录：目录在前、名称不区分大小写排序；附带每项可预览类型。"""
+    d = _fs_resolve(rel)
+    if not d.exists():
+        raise FileNotFoundError("目录不存在")
+    if not d.is_dir():
+        raise ValueError("不是目录")
+    try:
+        entries = list(d.iterdir())
+    except PermissionError as e:
+        raise PermissionError("无权访问该目录") from e
+    def sort_key(ep: Path):
+        try:
+            return (not ep.is_dir(), ep.name.lower())
+        except OSError:
+            return (True, ep.name.lower())
+    entries.sort(key=sort_key)
+    total = len(entries)
+    entries = entries[: FS_LIST_MAX]
+    items = []
+    for ep in entries:
+        try:
+            st = ep.stat()
+        except OSError:
+            continue
+        rel_child = str(ep.relative_to(FS_ROOT))
+        item = {
+            "name": ep.name,
+            "dir": ep.is_dir(),
+            "size": 0 if ep.is_dir() else st.st_size,
+            "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+            "rel": rel_child,
+        }
+        if not item["dir"]:
+            item["kind"] = _fs_kind(ep)
+            # 预览大小超限就只给下载
+            item["previewable"] = (item["kind"] == "text" and st.st_size <= FS_TEXT_MAX) or (
+                item["kind"] == "image" and st.st_size <= FS_IMAGE_MAX
+            )
+        items.append(item)
+    rel_out = ""
+    if d != FS_ROOT:
+        try:
+            rel_out = str(d.relative_to(FS_ROOT))
+        except ValueError:
+            rel_out = ""
+    return {"root": str(FS_ROOT), "rel": rel_out,
+            "total": total, "truncated": total > len(items), "items": items}
+
+
 MANAGE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -739,6 +861,62 @@ __FAVICON__
   .uphistory button.op:hover:not(:disabled) { background: var(--accent); }
   .uphistory button.op:disabled { opacity: .5; cursor: default; }
   .uphistory button.op.del:hover:not(:disabled) { background: var(--danger); }
+  .uphistory .histpager {
+    display: flex; align-items: center; gap: 10px; justify-content: flex-end;
+    padding: 6px 8px 2px; font-size: 12px; color: var(--muted);
+  }
+  .uphistory .histpager .pg {
+    appearance: none; border: 1px solid var(--line); cursor: pointer;
+    border-radius: 6px; padding: 3px 10px; font-size: 12px;
+    background: #2b3645; color: var(--text);
+  }
+  .uphistory .histpager .pg:hover:not(:disabled) { background: var(--accent); }
+  .uphistory .histpager .pg:disabled { opacity: .4; cursor: default; }
+  .fscrumb {
+    font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--muted); margin: 2px 0 8px; word-break: break-all;
+  }
+  .fscrumb a { color: var(--accent); text-decoration: none; cursor: pointer; }
+  .fscrumb a:hover { text-decoration: underline; }
+  .fslist { max-height: 480px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+  .fslist table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .fslist th {
+    position: sticky; top: 0; background: var(--panel);
+    text-align: left; font-weight: 600; color: var(--muted);
+    padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 12px;
+  }
+  .fslist td { padding: 6px 10px; border-bottom: 1px solid rgba(255,255,255,.04); }
+  .fslist tr:hover td { background: rgba(255,255,255,.03); }
+  .fslist .dname { cursor: pointer; color: var(--accent); }
+  .fslist .dname.file { color: var(--text); }
+  .fslist .sz { color: var(--muted); white-space: nowrap; font-size: 12px; }
+  .fslist .ops { white-space: nowrap; }
+  .fslist button.op2 {
+    appearance: none; border: 0; cursor: pointer; border-radius: 6px;
+    padding: 3px 9px; font-size: 12px; background: #2b3645; color: var(--text); margin-right: 4px;
+  }
+  .fslist button.op2:hover { background: var(--accent); }
+  .fsview-mask {
+    position: fixed; inset: 0; background: rgba(5,8,12,.82);
+    z-index: 10050; display: flex; align-items: center; justify-content: center;
+  }
+  .fsview {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    width: min(92vw, 1100px); max-height: 88vh; display: flex; flex-direction: column;
+  }
+  .fsview .vhead {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+  }
+  .fsview .vhead b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  .fsview .vbody { flex: 1; overflow: auto; padding: 12px 16px; }
+  .fsview pre {
+    margin: 0; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap; word-break: break-all; color: var(--text);
+  }
+  .fsview img { max-width: 100%; max-height: 70vh; display: block; margin: 0 auto; }
+  .fsview .vfoot { padding: 8px 16px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); }
   .lanbar .muted { color: var(--muted); }
   .hint { font-size: 12px; color: var(--muted); margin: -4px 0 10px; }
   input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
@@ -829,6 +1007,23 @@ __FAVICON__
     <div id="upHistory" class="uphistory" hidden></div>
     <input id="upFileInput" type="file" multiple hidden>
     <input id="upDirInput" type="file" webkitdirectory directory multiple hidden>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2 style="margin:0;font-size:16px">服务端文件</h2>
+      <div class="actions">
+        <button id="fsRefresh" class="secondary" type="button">刷新</button>
+        <button id="fsUpDir" class="secondary" type="button">上一级</button>
+        <button id="fsRoot" class="secondary" type="button">根目录</button>
+      </div>
+    </div>
+    <div id="fsCrumb" class="fscrumb"></div>
+    <div class="row" style="margin-bottom:8px">
+      <input id="fsPathInput" type="text" placeholder="输入绝对路径（如 /Users/xxx/web-terminal）或相对路径，回车跳转" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button id="fsGo" type="button">跳转</button>
+    </div>
+    <div id="fsList" class="fslist"><p class="empty">加载中…</p></div>
   </section>
 </main>
 
@@ -1564,8 +1759,12 @@ refresh().catch(e => flash(String(e.message || e), true));
   let done = 0, failed = 0, totalBytes = 0, sentBytes = 0;
   let active = false;
 
-  // ---- 上传历史：最近 10 条，一键复制服务器全路径 ----
+  // ---- 上传历史：最近 10 条，一键复制服务器全路径（分页展示，每页 5 条） ----
   const histEl = document.getElementById('upHistory');
+  const HIST_PAGE_SIZE = 5;
+  let histData = [];      // 倒序后的完整列表
+  let histPage = 0;       // 当前页（0 起）
+  let histHooked = false; // 容器级事件只挂一次
 
   function fmtSize(n) {
     n = Number(n) || 0;
@@ -1576,12 +1775,34 @@ refresh().catch(e => flash(String(e.message || e), true));
     return (n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
   }
 
+  function histPageCount() {
+    return Math.max(1, Math.ceil(histData.length / HIST_PAGE_SIZE));
+  }
+
   function renderHistory(list) {
     if (!histEl) return;
-    if (!list || !list.length) { histEl.hidden = true; histEl.innerHTML = ''; return; }
+    if (!list || !list.length) {
+      histData = []; histPage = 0;
+      histEl.hidden = true; histEl.innerHTML = '';
+      return;
+    }
+    histData = list.slice().sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')));
+    if (histPage >= histPageCount()) histPage = 0; // 列表变短（如删除）时回到第 1 页
+    // 容器级事件委托：翻页重渲染不用重复绑按钮
+    if (!histHooked) {
+      histHooked = true;
+      histEl.addEventListener('click', onHistClick);
+    }
+    drawHistPage();
+  }
+
+  function drawHistPage() {
+    const pages = histPageCount();
+    if (histPage >= pages) histPage = pages - 1;
+    const start = histPage * HIST_PAGE_SIZE;
+    const slice = histData.slice(start, start + HIST_PAGE_SIZE);
     let html = '<h3>最近上传 · 点击文件名复制服务器路径</h3><ul>';
-    const sorted = list.slice().sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')));
-    for (const h of sorted) {
+    for (const h of slice) {
       const rel = h.rel || (h.path || '').split('/').pop() || '';
       html += '<li data-rel="' + esc(rel) + '" data-path="' + esc(h.path || '') + '">' +
         '<span class="fname" title="' + esc(h.path) + '">' + esc(h.path) + '</span>' +
@@ -1593,109 +1814,123 @@ refresh().catch(e => flash(String(e.message || e), true));
         '</li>';
     }
     html += '</ul>';
+    if (pages > 1) {
+      html += '<div class="histpager">' +
+        '<button type="button" class="pg" data-pg="prev"' + (histPage === 0 ? ' disabled' : '') + '>‹ 上一页</button>' +
+        '<span class="pginfo">' + (histPage + 1) + ' / ' + pages + ' 页 · 共 ' + histData.length + ' 条</span>' +
+        '<button type="button" class="pg" data-pg="next"' + (histPage >= pages - 1 ? ' disabled' : '') + '>下一页 ›</button>' +
+        '</div>';
+    }
     histEl.innerHTML = html;
     histEl.hidden = false;
-    histEl.querySelectorAll('.cp').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const p = btn.getAttribute('data-path') || '';
-        let oked = false;
+  }
+
+  async function onHistClick(ev) {
+    const t = ev.target;
+    if (!t || t.tagName !== 'BUTTON') return;
+    // 翻页按钮
+    if (t.classList.contains('pg')) {
+      const pages = histPageCount();
+      if (t.getAttribute('data-pg') === 'prev' && histPage > 0) histPage -= 1;
+      else if (t.getAttribute('data-pg') === 'next' && histPage < pages - 1) histPage += 1;
+      drawHistPage();
+      return;
+    }
+    const li = t.closest('li');
+    if (!li) return;
+    const act = t.getAttribute('data-act');
+    const rel = li.getAttribute('data-rel') || '';
+    const path = li.getAttribute('data-path') || '';
+    if (t.classList.contains('cp')) {
+      let oked = false;
+      try {
+        await navigator.clipboard.writeText(path);
+        oked = true;
+      } catch (e) {
+        // clipboard API 不可用（如非安全上下文）时用 execCommand 兜底
         try {
-          await navigator.clipboard.writeText(p);
-          oked = true;
-        } catch (e) {
-          // clipboard API 不可用（如非安全上下文）时用 execCommand 兜底
-          try {
-            const ta = document.createElement('textarea');
-            ta.value = p;
-            ta.style.cssText = 'position:fixed;opacity:0;';
-            document.body.appendChild(ta);
-            ta.select();
-            oked = document.execCommand('copy');
-            ta.remove();
-          } catch (e2) { oked = false; }
+          const ta = document.createElement('textarea');
+          ta.value = path;
+          ta.style.cssText = 'position:fixed;opacity:0;';
+          document.body.appendChild(ta);
+          ta.select();
+          oked = document.execCommand('copy');
+          ta.remove();
+        } catch (e2) { oked = false; }
+      }
+      t.textContent = oked ? '✓ 已复制' : '复制失败';
+      t.classList.add('ok');
+      setTimeout(() => { t.textContent = '复制路径'; t.classList.remove('ok'); }, 1600);
+      return;
+    }
+    if (!rel || !path) return;
+    if (act === 'download') {
+      // 同源 fetch 带 Basic Auth（浏览器已缓存凭据），blob 触发保存
+      t.disabled = true; t.textContent = '…';
+      try {
+        const res = await fetch('/api/upload-download?rel=' + encodeURIComponent(rel), { credentials: 'same-origin' });
+        if (!res.ok) {
+          let msg = 'HTTP ' + res.status;
+          try { msg = (await res.json()).error || msg; } catch (e) {}
+          throw new Error(msg);
         }
-        btn.textContent = oked ? '✓ 已复制' : '复制失败';
-        btn.classList.add('ok');
-        setTimeout(() => { btn.textContent = '复制路径'; btn.classList.remove('ok'); }, 1600);
-      });
-    });
-    // 三个文件操作：下载 / 覆盖（重新上传） / 删除
-    histEl.querySelectorAll('button.op').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const li = btn.closest('li');
-        const act = btn.getAttribute('data-act');
-        const rel = li ? li.getAttribute('data-rel') || '' : '';
-        const path = li ? li.getAttribute('data-path') || '' : '';
-        if (!rel || !path) return;
-        if (act === 'download') {
-          // 同源 fetch 带 Basic Auth（浏览器已缓存凭据），blob 触发保存
-          btn.disabled = true; btn.textContent = '…';
-          try {
-            const res = await fetch('/api/upload-download?rel=' + encodeURIComponent(rel), { credentials: 'same-origin' });
-            if (!res.ok) {
-              let msg = 'HTTP ' + res.status;
-              try { msg = (await res.json()).error || msg; } catch (e) {}
-              throw new Error(msg);
-            }
-            const blob = await res.blob();
-            const a = document.createElement('a');
-            a.href = URL.createObjectURL(blob);
-            a.download = rel.split('/').pop() || 'download';
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(a.href), 30000);
-            flash('已开始下载 ' + rel.split('/').pop());
-          } catch (e) {
-            flash('下载失败: ' + (e.message || e), true);
-          }
-          btn.disabled = false; btn.textContent = '下载';
-          return;
-        }
-        if (act === 'overwrite') {
-          // 弹文件选择器 → 选中后直接覆盖写回服务器同一路径
-          const input = document.createElement('input');
-          input.type = 'file';
-          input.addEventListener('change', async () => {
-            const f = input.files && input.files[0];
-            if (!f) return;
-            if (!confirm('用「' + f.name + '」覆盖服务器上的 ' + rel + ' ？')) { input.value = ''; return; }
-            btn.disabled = true; btn.textContent = '…';
-            try {
-              const d = await api('/api/upload?rel=' + encodeURIComponent(rel) + '&overwrite=1', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/octet-stream' },
-                body: f,
-              });
-              flash('已覆盖 ' + rel + '（' + fmtSize(d.bytes || f.size) + '）');
-              updateHistoryFrom(d);
-            } catch (e) {
-              flash('覆盖失败: ' + (e.message || e), true);
-            }
-            btn.disabled = false; btn.textContent = '重新上传';
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = rel.split('/').pop() || 'download';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+        flash('已开始下载 ' + rel.split('/').pop());
+      } catch (e) {
+        flash('下载失败: ' + (e.message || e), true);
+      }
+      t.disabled = false; t.textContent = '下载';
+      return;
+    }
+    if (act === 'overwrite') {
+      // 弹文件选择器 → 选中后直接覆盖写回服务器同一路径
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.addEventListener('change', async () => {
+        const f = input.files && input.files[0];
+        if (!f) return;
+        if (!confirm('用「' + f.name + '」覆盖服务器上的 ' + rel + ' ？')) { input.value = ''; return; }
+        t.disabled = true; t.textContent = '…';
+        try {
+          const d = await api('/api/upload?rel=' + encodeURIComponent(rel) + '&overwrite=1', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: f,
           });
-          input.click();
-          return;
+          flash('已覆盖 ' + rel + '（' + fmtSize(d.bytes || f.size) + '）');
+          updateHistoryFrom(d);
+        } catch (e) {
+          flash('覆盖失败: ' + (e.message || e), true);
         }
-        if (act === 'delete') {
-          if (!confirm('删除服务器上的 ' + path + ' ？此操作不可恢复。')) return;
-          btn.disabled = true; btn.textContent = '…';
-          try {
-            const d = await api('/api/upload-delete', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ path: path }),
-            });
-            flash(d.already_gone ? '文件已不存在，已清理历史记录' : '已删除 ' + rel);
-            updateHistoryFrom(d);
-          } catch (e) {
-            flash('删除失败: ' + (e.message || e), true);
-          }
-          btn.disabled = false; btn.textContent = '删除';
-          return;
-        }
+        t.disabled = false; t.textContent = '重新上传';
       });
-    });
+      input.click();
+      return;
+    }
+    if (act === 'delete') {
+      if (!confirm('删除服务器上的 ' + path + ' ？此操作不可恢复。')) return;
+      t.disabled = true; t.textContent = '…';
+      try {
+        const d = await api('/api/upload-delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: path }),
+        });
+        flash(d.already_gone ? '文件已不存在，已清理历史记录' : '已删除 ' + rel);
+        updateHistoryFrom(d);
+      } catch (e) {
+        flash('删除失败: ' + (e.message || e), true);
+      }
+      t.disabled = false; t.textContent = '删除';
+      return;
+    }
   }
 
   async function loadHistory() {
@@ -1846,6 +2081,190 @@ refresh().catch(e => flash(String(e.message || e), true));
   });
 
   loadHistory();  // 页面加载即显示最近上传
+})();
+
+// ---- 服务端文件浏览 / 预览 / 下载 ----
+(function () {
+  const crumbEl = document.getElementById('fsCrumb');
+  const listEl = document.getElementById('fsList');
+  if (!crumbEl || !listEl) return;
+  let curRel = '';
+  let curRoot = '';
+
+  function fmtSize(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + ' B';
+    const u = ['KB', 'MB', 'GB', 'TB'];
+    let i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+    return (n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
+  }
+
+  function renderCrumb(rel) {
+    const parts = rel ? rel.split('/') : [];
+    let html = '<a data-rel="">/ (root)</a>';
+    let acc = '';
+    for (const p of parts) {
+      acc = acc ? acc + '/' + p : p;
+      html += ' / <a data-rel="' + esc(acc) + '">' + esc(p) + '</a>';
+    }
+    crumbEl.innerHTML = html;
+    crumbEl.querySelectorAll('a').forEach(a => {
+      a.addEventListener('click', () => load(a.getAttribute('data-rel') || ''));
+    });
+  }
+
+  async function load(rel) {
+    listEl.innerHTML = '<p class="empty">加载中…</p>';
+    try {
+      const d = await api('/api/fs-list?rel=' + encodeURIComponent(rel));
+      curRel = d.rel || '';
+      curRoot = d.root || '';
+      renderCrumb(curRel);
+      if (!d.items || !d.items.length) {
+        listEl.innerHTML = '<p class="empty">空目录</p>';
+        return;
+      }
+      let html = '<table><thead><tr><th style="width:46%">名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead><tbody>';
+      for (const it of d.items) {
+        const nameCls = it.dir ? 'dname' : 'dname file';
+        const nav = it.dir ? ' data-nav="1"' : '';
+        html += '<tr data-rel="' + esc(it.rel) + '" data-dir="' + (it.dir ? 1 : 0) + '" data-kind="' + esc(it.kind || '') + '" data-previewable="' + (it.previewable ? 1 : 0) + '">' +
+          '<td><span class="' + nameCls + '"' + nav + '>' + (it.dir ? '📁 ' : (it.kind === 'image' ? '🖼 ' : '📄 ')) + esc(it.name) + '</span></td>' +
+          '<td class="sz">' + (it.dir ? '-' : fmtSize(it.size)) + '</td>' +
+          '<td class="sz">' + esc(it.mtime) + '</td>' +
+          '<td class="ops">' +
+          (it.dir ? '' :
+            (it.previewable ? '<button class="op2" data-act="preview">预览</button>' : '') +
+            '<button class="op2" data-act="download">下载</button>') +
+          '</td></tr>';
+      }
+      if (d.truncated) {
+        html += '<tr><td colspan="4" class="sz">仅显示前 ' + d.items.length + ' 项（共 ' + d.total + ' 项）</td></tr>';
+      }
+      html += '</tbody></table>';
+      listEl.innerHTML = html;
+      // 目录点击进入；文件名点击=预览（可预览时）
+      listEl.querySelectorAll('span.dname[data-nav]').forEach(el => {
+        el.addEventListener('click', () => {
+          const tr = el.closest('tr');
+          load(tr.getAttribute('data-rel') || '');
+        });
+      });
+      listEl.querySelectorAll('span.dname.file').forEach(el => {
+        el.addEventListener('click', () => {
+          const tr = el.closest('tr');
+          if (tr.getAttribute('data-previewable') === '1') doPreview(tr);
+        });
+      });
+      listEl.querySelectorAll('button.op2').forEach(btn => {
+        btn.addEventListener('click', ev => {
+          ev.stopPropagation();
+          const tr = btn.closest('tr');
+          if (btn.getAttribute('data-act') === 'download') doDownload(tr);
+          else doPreview(tr);
+        });
+      });
+    } catch (e) {
+      listEl.innerHTML = '<p class="empty">加载失败: ' + esc(String(e.message || e)) + '</p>';
+    }
+  }
+
+  function doDownload(tr) {
+    const rel = tr.getAttribute('data-rel') || '';
+    const a = document.createElement('a');
+    // 同源 + Basic Auth（浏览器已缓存）；后端流式下发
+    a.href = '/api/fs-download?rel=' + encodeURIComponent(rel);
+    a.download = rel.split('/').pop() || 'download';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    flash('已开始下载 ' + (rel.split('/').pop() || ''));
+  }
+
+  function closeView() {
+    const m = document.getElementById('fsviewMask');
+    if (m) m.remove();
+  }
+
+  async function doPreview(tr) {
+    const rel = tr.getAttribute('data-rel') || '';
+    const kind = tr.getAttribute('data-kind') || '';
+    const name = (rel.split('/').pop() || '');
+    closeView();
+    const mask = document.createElement('div');
+    mask.id = 'fsviewMask';
+    mask.className = 'fsview-mask';
+    mask.innerHTML = '<div class="fsview" role="dialog" aria-modal="true">' +
+      '<div class="vhead"><b>' + esc(name) + '</b>' +
+      '<button class="secondary" id="fsviewDl" type="button">下载</button>' +
+      '<button class="secondary" id="fsviewClose" type="button">关闭</button></div>' +
+      '<div class="vbody" id="fsviewBody"><p class="empty">加载中…</p></div>' +
+      '<div class="vfoot" id="fsviewFoot"></div></div>';
+    document.body.appendChild(mask);
+    mask.addEventListener('click', ev => { if (ev.target === mask) closeView(); });
+    document.getElementById('fsviewClose').addEventListener('click', closeView);
+    document.getElementById('fsviewDl').addEventListener('click', () => {
+      const a = document.createElement('a');
+      a.href = '/api/fs-download?rel=' + encodeURIComponent(rel);
+      a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+    document.addEventListener('keydown', function esc(ev) {
+      if (ev.key === 'Escape') { closeView(); document.removeEventListener('keydown', esc); }
+    });
+    const body = document.getElementById('fsviewBody');
+    const foot = document.getElementById('fsviewFoot');
+    try {
+      if (kind === 'image') {
+        // 同源直链；后端按后缀给 Content-Type
+        body.innerHTML = '<img src="/api/fs-image?rel=' + encodeURIComponent(rel) + '" alt="' + esc(name) + '" ' +
+          'onerror="this.parentNode.innerHTML=\'<p class=empty>图片加载失败</p>\'">';
+        foot.textContent = name;
+      } else {
+        const d = await api('/api/fs-text?rel=' + encodeURIComponent(rel));
+        body.innerHTML = '<pre>' + esc(d.text) + '</pre>';
+        foot.textContent = name + ' · ' + fmtSize(d.size) + ' · ' + (d.encoding || '') + (d.truncated ? ' · 已截断（前 50 万字符）' : '');
+      }
+    } catch (e) {
+      body.innerHTML = '<p class="empty">预览失败: ' + esc(String(e.message || e)) + '</p>';
+    }
+  }
+
+  document.getElementById('fsRefresh').addEventListener('click', () => load(curRel));
+  document.getElementById('fsUpDir').addEventListener('click', () => {
+    if (!curRel) return;
+    const parts = curRel.split('/');
+    parts.pop();
+    load(parts.join('/'));
+  });
+  document.getElementById('fsRoot').addEventListener('click', () => load(''));
+
+  // ---- 路径跳转：支持绝对路径（根内）/ ~/xxx / 相对路径，回车或按钮触发 ----
+  const pathInput = document.getElementById('fsPathInput');
+  function goPath() {
+    const v = (pathInput.value || '').trim();
+    if (!v) return;
+    // 后端负责归一化与校验；成功后面包屑/列表切到目标目录
+    load(v).then(() => {
+      try {
+        // 同步输入框为服务端返回的规范相对路径，避免用户看到自己输入的原始形式
+        pathInput.value = curRel ? (curRoot ? curRoot + '/' : '') + curRel : (curRoot || '/');
+      } catch (e) {}
+    });
+  }
+  document.getElementById('fsGo').addEventListener('click', goPath);
+  pathInput.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') { ev.preventDefault(); goPath(); }
+  });
+  // 目录加载成功后把当前绝对路径回填输入框（也方便复制）
+  const _origLoad = load;
+  load = async function (rel) {
+    await _origLoad(rel);
+    if (curRoot) pathInput.value = curRel ? curRoot + '/' + curRel : curRoot;
+  };
+
+  load('');  // 默认根目录
 })();
 
 // 省流量：标签页不可见时停止轮询；切回前台立即刷新一次，体验不变。
@@ -2463,6 +2882,111 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass  # 客户端取消下载
             sys.stderr.write(f"[upload] download {rel} ({size} bytes)\n")
+            return
+        if path == "/api/fs-list":
+            raw = unquote((parse_qs(parsed.query).get("rel") or [""])[0]).strip()
+            try:
+                # 支持三种输入：相对路径 / 绝对路径（根内）/ ~/ 开头；统一归一为根内相对路径
+                rel = _fs_rel_from_abs(raw)
+                self._json(200, fs_list(rel))
+            except FileNotFoundError as e:
+                self._json(404, {"error": str(e)})
+            except (ValueError, PermissionError) as e:
+                self._json(400, {"error": str(e)})
+            except OSError as e:
+                self._json(500, {"error": str(e)})
+            return
+        if path == "/api/fs-text":
+            rel = unquote((parse_qs(parsed.query).get("rel") or [""])[0]).strip()
+            try:
+                p = _fs_resolve(rel)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            if not p.is_file():
+                self._json(404, {"error": "文件不存在"})
+                return
+            if p.stat().st_size > FS_TEXT_MAX:
+                self._json(400, {"error": f"超过 {FS_TEXT_MAX // 1024 // 1024}MB，请下载后查看"})
+                return
+            if _fs_kind(p) not in ("text", "binary"):
+                # 图片等其它类型走 /api/fs-image；但 svg 归文本
+                pass
+            try:
+                raw = p.read_bytes()
+                text = raw.decode("utf-8")  # 解不开就报错，不猜编码
+            except UnicodeDecodeError:
+                try:
+                    text = raw.decode("utf-8", errors="replace")
+                    self._json(200, {"rel": rel, "name": p.name, "size": len(raw), "truncated": False,
+                                     "text": text[:200000], "encoding": "utf-8? (含二进制字符,已替换)"})
+                except Exception as e:
+                    self._json(500, {"error": str(e)})
+                return
+            except OSError as e:
+                self._json(500, {"error": str(e)})
+                return
+            limit = 500000  # 前端渲染上限 50 万字符
+            self._json(200, {"rel": rel, "name": p.name, "size": len(raw), "truncated": len(text) > limit,
+                             "text": text[:limit], "encoding": "utf-8"})
+            return
+        if path == "/api/fs-image":
+            rel = unquote((parse_qs(parsed.query).get("rel") or [""])[0]).strip()
+            try:
+                p = _fs_resolve(rel)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            if not p.is_file():
+                self._json(404, {"error": "文件不存在"})
+                return
+            size = p.stat().st_size
+            if size > FS_IMAGE_MAX:
+                self._json(400, {"error": f"图片超过 {FS_IMAGE_MAX // 1024 // 1024}MB，请下载后查看"})
+                return
+            ctype = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                     "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+                     "ico": "image/x-icon", "avif": "image/avif"}.get(p.suffix.lower().lstrip("."), "application/octet-stream")
+            try:
+                self._send(200, p.read_bytes(), ctype)
+            except OSError as e:
+                self._json(500, {"error": str(e)})
+            return
+        if path == "/api/fs-download":
+            rel = unquote((parse_qs(parsed.query).get("rel") or [""])[0]).strip()
+            try:
+                p = _fs_resolve(rel)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            if not p.is_file():
+                self._json(404, {"error": "文件不存在"})
+                return
+            try:
+                size = p.stat().st_size
+            except OSError as e:
+                self._json(500, {"error": str(e)})
+                return
+            if size > FS_DOWNLOAD_MAX:
+                self._json(400, {"error": "文件超过 2GB，暂不支持下载"})
+                return
+            quoted = quote(p.name)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                with p.open("rb") as f:
+                    while True:
+                        chunk = f.read(UPLOAD_BLOCK)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            sys.stderr.write(f"[fs] download {rel} ({size} bytes)\n")
             return
         if path == "/api/unlock":
             self._json(200, {"ok": self._has_valid_unlock()})
