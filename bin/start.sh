@@ -24,10 +24,10 @@ fi
 
 remove_old_agents
 
-install_daemon "uk.lucadesign.web-terminal.ttyd"
-install_daemon "uk.lucadesign.web-terminal.manage"
-install_daemon "uk.lucadesign.web-terminal.cloudflared"
-install_daemon "uk.lucadesign.web-terminal.healthcheck"
+install_daemon "${LABEL_TTYD}"
+install_daemon "${LABEL_MANAGE}"
+install_daemon "${LABEL_CLOUDFLARED}"
+install_daemon "${LABEL_HEALTHCHECK}"
 
 echo
 echo "管理页:    https://${PUBLIC_HOST}/"

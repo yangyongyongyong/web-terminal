@@ -182,7 +182,7 @@ cmd_create() {
     exit 1
   fi
   sid="$(session_id "${name}")"
-  if "${TMUX_BIN}" has-session -t "${sid}" 2>/dev/null; then
+  if "${TMUX_BIN}" has-session -t "=${sid}" 2>/dev/null; then
     # 已存在：补写缺失的 cwd 元数据（不改正在跑的目录）
     if [[ -z "$(meta_get "${sid}" cwd)" ]]; then
       now="$(pane_cwd "${sid}")"
@@ -210,7 +210,7 @@ cmd_kill() {
     exit 1
   fi
   sid="$(session_id "${name}")"
-  if ! "${TMUX_BIN}" has-session -t "${sid}" 2>/dev/null; then
+  if ! "${TMUX_BIN}" has-session -t "=${sid}" 2>/dev/null; then
     echo "会话不存在或已停止: ${name}" >&2
     exit 1
   fi
@@ -364,11 +364,11 @@ cmd_rename() {
   old_sid="$(session_id "${old}")"
   new_sid="$(session_id "${new}")"
 
-  if "${TMUX_BIN}" has-session -t "${new_sid}" 2>/dev/null; then
+  if "${TMUX_BIN}" has-session -t "=${new_sid}" 2>/dev/null; then
     echo "目标名称已存在（运行中）: ${new}" >&2
     exit 1
   fi
-  if "${TMUX_BIN}" has-session -t "${old_sid}" 2>/dev/null; then
+  if "${TMUX_BIN}" has-session -t "=${old_sid}" 2>/dev/null; then
     live=1
   fi
 
@@ -425,7 +425,7 @@ PY
   fi
 
   if [[ "${live}" -eq 1 ]]; then
-    "${TMUX_BIN}" rename-session -t "${old_sid}" "${new_sid}"
+    "${TMUX_BIN}" rename-session -t "=${old_sid}" "${new_sid}"
     local f key
     for f in "${META_DIR}/${old_sid}".*; do
       [[ -e "${f}" ]] || continue

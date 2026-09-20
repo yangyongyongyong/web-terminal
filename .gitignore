@@ -2,6 +2,14 @@
 .env
 .env.*
 !.env.example
+LOCAL.md
+
+# Cloudflare Tunnel 真实配置（域名/ID 私有；模板见 cloudflared.yml.example）
+config/cloudflared.yml
+
+# 真实 LaunchDaemon plist（用户名/路径私有；模板见 plist-templates/，用 bin/render-plists.sh 渲染）
+config/*.web-terminal.*.plist
+!config/plist-templates/
 
 logs/
 run/

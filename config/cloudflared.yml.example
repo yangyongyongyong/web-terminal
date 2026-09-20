@@ -1,9 +1,8 @@
-# Cloudflare Tunnel → 管理页(7690) + ttyd(/term → 7681)
-# tunnel: web-terminal
-tunnel: 7969fb73-7802-4be4-8205-899320051f34
-credentials-file: /Users/thomas990p/.cloudflared/7969fb73-7802-4be4-8205-899320051f34.json
+# Cloudflare Tunnel 配置模板（复制为 cloudflared.yml 并填入你的值；真实文件不入库）
+# tunnel: <你的 Tunnel 名>
+tunnel: <tunnel-uuid>
+credentials-file: ~/.cloudflared/<tunnel-uuid>.json
 
-# 源站连接更耐抖（WebSocket / 长连接）
 originRequest:
   connectTimeout: 30s
   tcpKeepAlive: 30s
@@ -14,13 +13,13 @@ originRequest:
 
 ingress:
   # 终端（WebSocket）：必须带 /term 前缀
-  - hostname: term.lucadesign.uk
+  - hostname: <你的域名>
     path: ^/term/?.*
     service: http://127.0.0.1:7681
     originRequest:
       http2Origin: false
   # 会话管理首页与 API
-  - hostname: term.lucadesign.uk
+  - hostname: <你的域名>
     service: http://127.0.0.1:7690
     originRequest:
       http2Origin: false

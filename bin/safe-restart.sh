@@ -53,18 +53,18 @@ mkdir -p "${ROOT}/logs" "${ROOT}/run"
     remove_old_agents_app_only
   fi
 
-  install_daemon "uk.lucadesign.web-terminal.ttyd"
+  install_daemon "${LABEL_TTYD}"
   sleep 1
-  install_daemon "uk.lucadesign.web-terminal.manage"
+  install_daemon "${LABEL_MANAGE}"
   sleep 1
   if [[ "${WITH_TUNNEL}" -eq 1 ]]; then
     echo "WARNING: 正在重启 cloudflared（--with-tunnel）；共用该隧道的其它服务会短暂中断"
-    install_daemon "uk.lucadesign.web-terminal.cloudflared"
+    install_daemon "${LABEL_CLOUDFLARED}"
     sleep 1
   else
     echo "跳过 cloudflared（避免中断共用隧道；需要时加 --with-tunnel）"
   fi
-  install_daemon "uk.lucadesign.web-terminal.healthcheck"
+  install_daemon "${LABEL_HEALTHCHECK}"
 
   sleep 2
   "${ROOT}/bin/status.sh" || true

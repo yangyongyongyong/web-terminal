@@ -3,8 +3,8 @@
 set -euo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export HOME="${HOME:-/Users/thomas990p}"
-export USER="${USER:-thomas990p}"
+export HOME="${HOME:-$(eval echo ~$(id -un))}"
+export USER="${USER:-$(id -un)}"
 export LANG="${LANG:-zh_CN.UTF-8}"
 export LC_ALL="${LC_ALL:-zh_CN.UTF-8}"
 export TERM_PROGRAM="${TERM_PROGRAM:-ttyd}"

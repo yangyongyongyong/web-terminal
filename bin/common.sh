@@ -20,7 +20,7 @@ set +a
 : "${TTYD_HOST:=127.0.0.1}"
 : "${TTYD_PORT:=7681}"
 : "${TMUX_SESSION:=web-term}"
-: "${PUBLIC_HOST:=term.lucadesign.uk}"
+: "${PUBLIC_HOST:=term.example.com}"   # 真实域名写 .env 的 PUBLIC_HOST（本地 LOCAL.md 有记录）
 : "${USE_TMUX:=1}"
 : "${LOGIN_SHELL:=/bin/zsh}"
 : "${MANAGE_HOST:=127.0.0.1}"

@@ -3,36 +3,36 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>uk.lucadesign.web-terminal.healthcheck</string>
+  <string>web-terminal.healthcheck</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/thomas990p/web-terminal/bin/healthcheck.sh</string>
+    <string>__HOME__/web-terminal/bin/healthcheck.sh</string>
   </array>
   <key>UserName</key>
-  <string>thomas990p</string>
+  <string>__USER__</string>
   <key>GroupName</key>
   <string>staff</string>
   <key>WorkingDirectory</key>
-  <string>/Users/thomas990p/web-terminal</string>
+  <string>__HOME__/web-terminal</string>
   <key>StartInterval</key>
   <integer>30</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/thomas990p/web-terminal/logs/healthcheck.launchd.log</string>
+  <string>__HOME__/web-terminal/logs/healthcheck.launchd.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/thomas990p/web-terminal/logs/healthcheck.launchd.log</string>
+  <string>__HOME__/web-terminal/logs/healthcheck.launchd.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
-    <string>/Users/thomas990p</string>
+    <string>__HOME__</string>
     <key>USER</key>
-    <string>thomas990p</string>
+    <string>__USER__</string>
     <key>LOGNAME</key>
-    <string>thomas990p</string>
+    <string>__USER__</string>
   </dict>
 </dict>
 </plist>

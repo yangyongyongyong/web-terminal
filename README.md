@@ -2,11 +2,12 @@
 
 通过 **ttyd + tmux + 会话管理页 + Cloudflare Tunnel + LaunchAgent**，用浏览器打开本机 shell。
 
-- 管理页：https://term.lucadesign.uk/
-- 终端：https://term.lucadesign.uk/term/?arg=main
+- 管理页：`https://<你的域名>/`
+- 终端：`https://<你的域名>/term/?arg=main`
 - 本机管理：http://127.0.0.1:7690/
 - 本机终端：http://127.0.0.1:7681/term/
 - 项目目录：`~/web-terminal`
+- 真实域名 / Tunnel ID 等本机私有配置见 `LOCAL.md`（不入库，见下文）
 
 ## 能力
 
@@ -61,29 +62,29 @@ web-terminal/
 ├── config/
 │   ├── cloudflared.yml
 │   ├── tmux.web.conf
-│   └── uk.lucadesign.web-terminal.*.plist
+│   └── <label>.web-terminal.*.plist
 ├── web/                 # ttyd 自定义页（启动时生成）+ wt-*.js / wt-icon-*（favicon 源）
 ├── logs/
-└── run/
+├── run/
+└── LOCAL.md             # 本机私有配置记录（gitignore，不入库）
 ```
 
 ## Cloudflare
 
-| 项 | 值 |
+ingress 结构（真实域名与 Tunnel ID 记在本地 `LOCAL.md`）：
+
+| 路径 | 指向 |
 |----|-----|
-| Tunnel | `web-terminal` |
-| ID | `7969fb73-7802-4be4-8205-899320051f34` |
-| 域名 | `term.lucadesign.uk` |
 | `/` | 管理页 → `127.0.0.1:7690` |
 | `/term` | ttyd → `127.0.0.1:7681` |
-| 凭据 | `~/.cloudflared/7969fb73-7802-4be4-8205-899320051f34.json` |
 
 ## 安全
 
 1. **`.env` 永不上传**：已在 `.gitignore`；别人克隆后 `cp .env.example .env` 自己填密码/PIN。
-2. 在 Cloudflare Zero Trust → Access 给域名加登录策略（推荐）。
-3. 仅监听 `127.0.0.1`，不暴露公网端口。
-4. 不要提交 tunnel 凭据（`~/.cloudflared/*.json`）。
+2. **`LOCAL.md` 不入库**：真实域名、Tunnel ID、LaunchDaemon label 等本机私有信息只写在 `LOCAL.md`（已 gitignore）。
+3. 在 Cloudflare Zero Trust → Access 给域名加登录策略（推荐）。
+4. 仅监听 `127.0.0.1`，不暴露公网端口。
+5. 不要提交 tunnel 凭据（`~/.cloudflared/*.json`）。
 
 ## 说明
 

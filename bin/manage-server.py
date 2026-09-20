@@ -41,7 +41,7 @@ def load_env() -> dict[str, str]:
 ENV = load_env()
 USER = ENV.get("TTYD_USER", "admin")
 PASSWORD = ENV["TTYD_PASSWORD"]
-PUBLIC_HOST = ENV.get("PUBLIC_HOST", "term.lucadesign.uk")
+PUBLIC_HOST = ENV.get("PUBLIC_HOST", "term.example.com")  # 真实域名在 .env；占位符不入库
 MANAGE_HOST = ENV.get("MANAGE_HOST", "127.0.0.1")
 MANAGE_PORT = int(ENV.get("MANAGE_PORT", "7690"))
 HOME = str(Path.home())
@@ -807,6 +807,8 @@ __FAVICON__
   .empty { color: var(--muted); padding: 16px 4px; }
   .flash { margin: 0 0 14px; padding: 10px 12px; border-radius: 8px; background: #1e2a38; color: var(--muted); }
   .flash.err { background: rgba(243,18,96,.12); color: #ff8fab; }
+  /* 弹窗内的错误提示：弹窗遮罩会挡住页面顶部 flash，错误必须就地显示 */
+  .modal-err { margin: -4px 0 10px; font-size: 12px; color: #ff8fab; word-break: break-all; }
   .lanbar { margin: 0 0 14px; padding: 10px 12px; border-radius: 8px; background: rgba(46,160,67,.12); color: #7ee787; font-size: 13px; line-height: 1.6; }
   .lanbar code { background: rgba(0,0,0,.25); padding: 1px 6px; border-radius: 4px; color: #d2e6ff; user-select: all; }
   .trafficbar {
@@ -1044,6 +1046,7 @@ __FAVICON__
     <h3 id="nameTitle">新建会话</h3>
     <p id="nameHint">输入会话名称</p>
     <input id="nameInput" type="text" maxlength="64" autocomplete="off" placeholder="例如 work / web终端">
+    <p id="nameErr" class="modal-err" hidden></p>
     <div class="row">
       <button id="nameCancel" class="secondary" type="button">取消</button>
       <button id="nameConfirm" type="button">下一步</button>
@@ -1518,6 +1521,15 @@ function closeNameModal() {
   nameModalMode = null;
   document.getElementById('nameModal').hidden = true;
   document.getElementById('nameInput').value = '';
+  setNameErr('');
+}
+
+// 弹窗内就地显示错误：全屏遮罩会挡住页面顶部的 flash，用户会以为按钮没反应
+function setNameErr(msg) {
+  const el = document.getElementById('nameErr');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.hidden = !msg;
 }
 
 function openNameModal() {
@@ -1559,11 +1571,12 @@ function openCloneModal(srcName, cwd) {
 
 async function submitNameModal() {
   const name = (document.getElementById('nameInput').value || '').trim();
-  if (!name) { flash('请输入会话名', true); return; }
+  if (!name) { setNameErr('请输入会话名'); return; }
   if (!isValidSessionName(name)) {
-    flash('会话名支持中英文、数字、_ -，最长 64', true);
+    setNameErr('会话名仅支持中英文、数字、_ 和 -（不含 + 、空格、点号等），最长 64');
     return;
   }
+  setNameErr('');
   const mode = nameModalMode;
   if (mode && mode.type === 'rename') {
     if (name === mode.oldName) { closeNameModal(); return; }
@@ -1579,7 +1592,7 @@ async function submitNameModal() {
       flash('已重命名为 ' + name);
       await refresh();
     } catch (e) {
-      flash(String(e.message || e), true);
+      setNameErr(String(e.message || e));  // 服务端报错（如目标名已存在）也显示在弹窗内
     } finally {
       btn.disabled = false;
     }

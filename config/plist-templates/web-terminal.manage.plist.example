@@ -3,14 +3,14 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>uk.lucadesign.web-terminal.manage</string>
+  <string>web-terminal.manage</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/thomas990p/web-terminal/bin/run-manage.sh</string>
+    <string>__HOME__/web-terminal/bin/run-manage.sh</string>
   </array>
   <key>UserName</key>
-  <string>thomas990p</string>
+  <string>__USER__</string>
   <key>GroupName</key>
   <string>staff</string>
   <key>EnvironmentVariables</key>
@@ -18,21 +18,21 @@
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
-    <string>/Users/thomas990p</string>
+    <string>__HOME__</string>
     <key>USER</key>
-    <string>thomas990p</string>
+    <string>__USER__</string>
     <key>LOGNAME</key>
-    <string>thomas990p</string>
+    <string>__USER__</string>
   </dict>
   <key>WorkingDirectory</key>
-  <string>/Users/thomas990p/web-terminal</string>
+  <string>__HOME__/web-terminal</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/thomas990p/web-terminal/logs/manage.log</string>
+  <string>__HOME__/web-terminal/logs/manage.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/thomas990p/web-terminal/logs/manage.log</string>
+  <string>__HOME__/web-terminal/logs/manage.log</string>
 </dict>
 </plist>

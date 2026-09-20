@@ -4,11 +4,12 @@
 set -euo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export HOME="${HOME:-/Users/thomas990p}"
+export HOME="${HOME:-$(eval echo ~$(id -un))}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=common.sh
 source "${ROOT}/bin/common.sh" 2>/dev/null || true
+source "${ROOT}/bin/launchd-lib.sh" 2>/dev/null || true
 
 LOG="${ROOT}/logs/healthcheck.log"
 METRICS_READY="http://127.0.0.1:20242/ready"
@@ -76,7 +77,7 @@ new_log_lines_since_checkpoint() {
 # manage 挂了就拉起（不影响已有 tmux）
 if ! curl -s -o /dev/null --connect-timeout 2 --max-time 3 -u "${TTYD_USER}:${TTYD_PASSWORD}" "${MANAGE}"; then
   log "manage down → restart manage"
-  restart_service "uk.lucadesign.web-terminal.manage" '/Users/thomas990p/web-terminal/bin/manage-server.py'
+  restart_service "${LABEL_MANAGE}" "${ROOT}/bin/manage-server.py"
   sleep 1
 fi
 
@@ -84,7 +85,7 @@ if ! curl -s -o /dev/null --connect-timeout 2 --max-time 3 "${ORIGIN}"; then
   code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "${ORIGIN}" || echo 000)"
   if [[ "${code}" == "000" ]]; then
     log "origin ttyd down → restart ttyd"
-    restart_service "uk.lucadesign.web-terminal.ttyd" '/Users/thomas990p/web-terminal/bin/run-ttyd.sh'
+    restart_service "${LABEL_TTYD}" "${ROOT}/bin/run-ttyd.sh"
     sleep 2
   fi
 fi
@@ -115,7 +116,7 @@ PTMX_THRESHOLD=180
 
 if [[ "${new_fd_errors}" -ge "${FD_ERROR_THRESHOLD}" || "${open_ptmx}" -ge "${PTMX_THRESHOLD}" ]]; then
   log "ttyd fd leak suspected (new_fd_errors=${new_fd_errors}, open_ptmx=${open_ptmx}, pid=${TTYD_PID}) → restart ttyd"
-  restart_service "uk.lucadesign.web-terminal.ttyd" '/Users/thomas990p/web-terminal/bin/run-ttyd.sh'
+  restart_service "${LABEL_TTYD}" "${ROOT}/bin/run-ttyd.sh"
   sleep 2
 fi
 
@@ -134,6 +135,6 @@ log "tunnel not ready (readyConnections=${ready_n}, fail=${n}) body=${ready_json
 
 if [[ "${n}" -ge 1 ]]; then
   log "restarting cloudflared after failure"
-  restart_service "uk.lucadesign.web-terminal.cloudflared" 'cloudflared tunnel --config /Users/thomas990p/web-terminal/config/cloudflared.yml'
+  restart_service "${LABEL_CLOUDFLARED}" 'cloudflared tunnel --config '"${ROOT}"'/config/cloudflared.yml'
   reset_fail
 fi

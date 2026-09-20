@@ -4,8 +4,8 @@
 set -euo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export HOME="${HOME:-/Users/thomas990p}"
-export USER="${USER:-thomas990p}"
+export HOME="${HOME:-$(eval echo ~$(id -un))}"
+export USER="${USER:-$(id -un)}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${ROOT}/config/cloudflared.yml"

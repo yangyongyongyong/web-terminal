@@ -35,7 +35,8 @@ def favicon_links() -> str:
 
 
 def public_host() -> str:
-    return _env_val("PUBLIC_HOST", "term.lucadesign.uk")
+    # 真实域名从 .env 读；仓库内只留占位符（本地真实值见 LOCAL.md，不入库）
+    return _env_val("PUBLIC_HOST", "term.example.com")
 
 
 def manage_port() -> str:

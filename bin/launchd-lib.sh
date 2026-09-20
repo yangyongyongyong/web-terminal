@@ -2,12 +2,23 @@
 # LaunchDaemon 安装/卸载公共逻辑（system 域，开机无需图形登录）
 # shellcheck disable=SC2034
 
-LAUNCH_LABELS=(
-  uk.lucadesign.web-terminal.ttyd
-  uk.lucadesign.web-terminal.manage
-  uk.lucadesign.web-terminal.cloudflared
-  uk.lucadesign.web-terminal.healthcheck
-)
+# label 前缀由本地渲染的真实 plist 文件名决定（bin/render-plists.sh 生成；
+# 本机值记录在 LOCAL.md，不入库）。缺省回退到通用名。
+_plist_prefix() {
+  local first
+  first="$(ls "${ROOT}/config/"*.web-terminal.ttyd.plist 2>/dev/null | head -1)"
+  if [[ -n "${first}" ]]; then
+    basename "${first}" .plist | sed 's/\.ttyd$//'
+  else
+    echo "local.web-terminal"
+  fi
+}
+LAUNCH_PREFIX="$(_plist_prefix)"
+LABEL_TTYD="${LAUNCH_PREFIX}.ttyd"
+LABEL_MANAGE="${LAUNCH_PREFIX}.manage"
+LABEL_CLOUDFLARED="${LAUNCH_PREFIX}.cloudflared"
+LABEL_HEALTHCHECK="${LAUNCH_PREFIX}.healthcheck"
+LAUNCH_LABELS=("${LABEL_TTYD}" "${LABEL_MANAGE}" "${LABEL_CLOUDFLARED}" "${LABEL_HEALTHCHECK}")
 
 DAEMON_DIR="/Library/LaunchDaemons"
 AGENT_DIR="${HOME}/Library/LaunchAgents"
@@ -30,9 +41,9 @@ remove_old_agents_app_only() {
   local name uid_num
   uid_num="$(id -u)"
   for name in \
-    uk.lucadesign.web-terminal.ttyd \
-    uk.lucadesign.web-terminal.manage \
-    uk.lucadesign.web-terminal.healthcheck
+    ${LABEL_TTYD} \
+    ${LABEL_MANAGE} \
+    ${LABEL_HEALTHCHECK}
   do
     if launchctl print "gui/${uid_num}/${name}" &>/dev/null; then
       launchctl bootout "gui/${uid_num}/${name}" 2>/dev/null || true

@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=common.sh
 source "${ROOT}/bin/common.sh"
+# shellcheck source=launchd-lib.sh
+source "${ROOT}/bin/launchd-lib.sh"
 
 UID_NUM="$(id -u)"
 
@@ -27,10 +29,10 @@ check_one() {
   fi
 }
 
-check_one "uk.lucadesign.web-terminal.ttyd"
-check_one "uk.lucadesign.web-terminal.manage"
-check_one "uk.lucadesign.web-terminal.cloudflared"
-check_one "uk.lucadesign.web-terminal.healthcheck"
+check_one "${LABEL_TTYD}"
+check_one "${LABEL_MANAGE}"
+check_one "${LABEL_CLOUDFLARED}"
+check_one "${LABEL_HEALTHCHECK}"
 
 echo "--- 会话 ---"
 if out="$("${ROOT}/bin/session-ctl.sh" list)" && [[ -n "${out}" ]]; then
