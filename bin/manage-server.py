@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""会话管理页 + API（7690）。进入终端需 SESSION_PIN；工作目录受 SESSION_PATH_ROOT 限制。"""
+"""会话管理页 + API（7690）。进入终端需先登录（票据只签发给已登录用户）；工作目录受 SESSION_PATH_ROOT 限制。"""
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+import stat as _stat
 import threading
 import time
+import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -407,8 +412,22 @@ def _unique_dest(dir_path: Path, filename: str) -> Path:
     raise RuntimeError("同名文件过多，无法生成不冲突的文件名")
 
 
-def save_upload_stream(rel: str, length: int, rfile) -> tuple[Path, int]:
-    """把请求体原始字节流写入 ~/Downloads/<rel>，流式落盘不占内存。
+def upload_dir_for(user: str) -> Path:
+    """用户上传根目录：主用户 ~/Downloads（兼容旧数据），其他用户 ~/Downloads/<user>。"""
+    if is_primary(user):
+        return UPLOAD_DIR
+    return UPLOAD_DIR / user
+
+
+def upload_hist_file_for(user: str) -> Path:
+    """用户上传历史文件：主用户沿用全局文件（兼容），其他用户独立。"""
+    if is_primary(user):
+        return UPLOAD_HISTORY_FILE
+    return ROOT / "run" / f"upload-history-{session_ticket.sanitize_name(user)}.json"
+
+
+def save_upload_stream(rel: str, length: int, rfile, user: str = "") -> tuple[Path, int]:
+    """把请求体原始字节流写入用户上传目录/<rel>，流式落盘不占内存。
     返回 (最终路径, 实际字节数)。同名自动改名，绝不覆盖已有文件。"""
     if not _upload_rel_ok(rel):
         raise ValueError("不支持的文件名或路径")
@@ -416,15 +435,16 @@ def save_upload_stream(rel: str, length: int, rfile) -> tuple[Path, int]:
         raise ValueError("空文件")
     if length > UPLOAD_MAX_BYTES:
         raise ValueError(f"单文件超过 {UPLOAD_MAX_BYTES // (1024**3)}GB 上限")
-    dest_dir = UPLOAD_DIR
+    base = upload_dir_for(user)
+    dest_dir = base
     rel_parts = rel.split("/")
     if len(rel_parts) > 1:
-        dest_dir = UPLOAD_DIR.joinpath(*rel_parts[:-1])
+        dest_dir = base.joinpath(*rel_parts[:-1])
     dest_dir.mkdir(parents=True, exist_ok=True)
-    # 目标目录不得越过 ~/Downloads（防御纵深，正常到不了这里）
-    real_dl = UPLOAD_DIR.resolve()
+    # 目标目录不得越过用户上传根（防御纵深，正常到不了这里）
+    real_dl = base.resolve()
     real_dir = dest_dir.resolve()
-    # 目标目录必须等于 ~/Downloads 本身或位于其内部
+    # 目标目录必须等于上传根本身或位于其内部
     if real_dir != real_dl and real_dl not in real_dir.parents:
         raise ValueError("非法的目标目录")
     dest = _unique_dest(dest_dir, rel_parts[-1])
@@ -445,12 +465,12 @@ def save_upload_stream(rel: str, length: int, rfile) -> tuple[Path, int]:
     except OSError as e:
         dest.unlink(missing_ok=True)
         raise RuntimeError(f"写入失败: {e}") from e
-    record_upload(dest, written)
+    record_upload(dest, written, user)
     return dest, written
 
 
-def overwrite_upload_stream(rel: str, length: int, rfile) -> tuple[Path, int]:
-    """覆盖写入 ~/Downloads/<rel>（重新上传历史文件）。同名直接覆盖，不改名。
+def overwrite_upload_stream(rel: str, length: int, rfile, user: str = "") -> tuple[Path, int]:
+    """覆盖写入用户上传目录/<rel>（重新上传历史文件）。同名直接覆盖，不改名。
     先写临时文件再原子替换：中途失败不会把原文件写坏。"""
     if not _upload_rel_ok(rel):
         raise ValueError("不支持的文件名或路径")
@@ -458,7 +478,7 @@ def overwrite_upload_stream(rel: str, length: int, rfile) -> tuple[Path, int]:
         raise ValueError("空文件")
     if length > UPLOAD_MAX_BYTES:
         raise ValueError(f"单文件超过 {UPLOAD_MAX_BYTES // (1024**3)}GB 上限")
-    dest = _resolve_upload_rel(rel)
+    dest = _resolve_upload_rel(rel, user)
     if not dest.exists():
         raise ValueError("目标文件不存在（可能已被删除），请重新上传")
     if dest.is_dir():
@@ -484,7 +504,7 @@ def overwrite_upload_stream(rel: str, length: int, rfile) -> tuple[Path, int]:
         if isinstance(e, ConnectionError):
             raise
         raise RuntimeError(f"写入失败: {e}") from e
-    record_upload(dest, written)
+    record_upload(dest, written, user)
     return dest, written
 
 
@@ -494,22 +514,24 @@ UPLOAD_HISTORY_KEEP = 10
 _upload_hist_lock = threading.Lock()
 
 
-def load_upload_history() -> list[dict]:
+def load_upload_history(user: str = "") -> list[dict]:
+    f = upload_hist_file_for(user)
     try:
-        raw = json.loads(UPLOAD_HISTORY_FILE.read_text(encoding="utf-8"))
+        raw = json.loads(f.read_text(encoding="utf-8"))
         return raw if isinstance(raw, list) else []
     except (OSError, json.JSONDecodeError):
         return []
 
 
-def new_upload_batch_dir() -> Path:
-    """每次上传批次新建独立子目录 ~/Downloads/上传_<时间戳>。
-    解压/整理只影响本批文件，不污染 Downloads 其它内容。
+def new_upload_batch_dir(user: str = "") -> Path:
+    """每次上传批次新建独立子目录 <用户上传根>/上传_<时间戳>。
+    解压/整理只影响本批文件，不污染上传根其它内容。
     用服务端时钟命名（客户端时间不可信）；同一秒多批自动加 -2/-3 序号。"""
+    base = upload_dir_for(user)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     for i in range(100):
         name = f"上传_{stamp}" if i == 0 else f"上传_{stamp}-{i}"
-        d = UPLOAD_DIR / name
+        d = base / name
         try:
             d.mkdir(parents=True, exist_ok=False)
             return d
@@ -518,34 +540,36 @@ def new_upload_batch_dir() -> Path:
     raise RuntimeError("无法创建上传目录")
 
 
-def record_upload(dest: Path, size: int) -> None:
-    """追加一条上传记录，只保留最近 KEEP 条。失败不影响上传结果。"""
+def record_upload(dest: Path, size: int, user: str = "") -> None:
+    """追加一条上传记录到该用户的历史，只保留最近 KEEP 条。失败不影响上传结果。"""
     item = {
         "path": str(dest),
         "rel": dest.name,
         "bytes": size,
         "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }
+    hist_file = upload_hist_file_for(user)
     try:
         with _upload_hist_lock:
-            hist = load_upload_history()
+            hist = load_upload_history(user)
             hist.append(item)
-            UPLOAD_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = UPLOAD_HISTORY_FILE.with_suffix(".json.tmp")
+            hist_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = hist_file.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(hist[-UPLOAD_HISTORY_KEEP:], ensure_ascii=False, indent=1), encoding="utf-8")
-            tmp.replace(UPLOAD_HISTORY_FILE)  # 原子替换
+            tmp.replace(hist_file)  # 原子替换
     except OSError as e:
         sys.stderr.write(f"[upload] 记录历史失败(不影响文件): {e}\n")
 
 
-def prune_upload_history() -> list[dict]:
-    """清理不存在于磁盘的记录，供前端展示前调用。"""
+def prune_upload_history(user: str = "") -> list[dict]:
+    """清理不存在于磁盘的记录，供前端展示前调用（按用户）。"""
+    hist_file = upload_hist_file_for(user)
     with _upload_hist_lock:
-        hist = load_upload_history()
+        hist = load_upload_history(user)
         kept = [h for h in hist if Path(h.get("path", "")).exists()]
         if len(kept) != len(hist):
             try:
-                UPLOAD_HISTORY_FILE.write_text(
+                hist_file.write_text(
                     json.dumps(kept[-UPLOAD_HISTORY_KEEP:], ensure_ascii=False, indent=1),
                     encoding="utf-8",
                 )
@@ -554,46 +578,49 @@ def prune_upload_history() -> list[dict]:
         return kept[-UPLOAD_HISTORY_KEEP:]
 
 
-def _resolve_upload_rel(rel: str) -> Path:
-    """把历史记录里的相对路径安全解析到 ~/Downloads 内的绝对路径。
+def _resolve_upload_rel(rel: str, user: str = "") -> Path:
+    """把历史记录里的相对路径安全解析到该用户上传根内的绝对路径。
     复用上传的路径校验（拒绝穿越/绝对路径/隐藏文件），并二次确认
-    解析结果确实位于 Downloads 内（防 symlink 逃逸）。"""
+    解析结果确实位于该用户上传根内（防 symlink 逃逸）。"""
     if not _upload_rel_ok(rel):
         raise ValueError("不支持的文件名或路径")
-    dest = UPLOAD_DIR.joinpath(*rel.split("/"))
-    real_dl = UPLOAD_DIR.resolve()
+    base = upload_dir_for(user)
+    dest = base.joinpath(*rel.split("/"))
+    real_dl = base.resolve()
     real_dest = dest.resolve(strict=False)
     if real_dest != real_dl and real_dl not in real_dest.parents:
         raise ValueError("非法的目标路径")
     return dest
 
 
-def remove_upload_file(path: str) -> dict:
-    """删除上传历史对应的文件（仅限 Downloads 内），同步清理历史记录。"""
+def remove_upload_file(path: str, user: str = "") -> dict:
+    """删除上传历史对应的文件（仅限该用户上传根内），同步清理历史记录。"""
+    base = upload_dir_for(user)
     try:
-        rel = str(Path(path).resolve().relative_to(UPLOAD_DIR.resolve()))
+        rel = str(Path(path).resolve().relative_to(base.resolve()))
     except ValueError:
-        raise ValueError("只能删除 Downloads 内的文件")
-    dest = _resolve_upload_rel(rel)
+        raise ValueError("只能删除自己上传目录内的文件")
+    dest = _resolve_upload_rel(rel, user)
     if not dest.exists():
-        _prune_hist_record(str(dest))
+        _prune_hist_record(str(dest), user)
         return {"ok": True, "already_gone": True, "rel": rel}
     if dest.is_dir():
         raise ValueError("是目录不是文件，请手动删除")
     dest.unlink()
-    _prune_hist_record(str(dest))
+    _prune_hist_record(str(dest), user)
     sys.stderr.write(f"[upload] deleted {rel}\n")
     return {"ok": True, "rel": rel}
 
 
-def _prune_hist_record(abs_path: str) -> None:
-    """从上传历史里移除一条记录（按绝对路径匹配）。"""
+def _prune_hist_record(abs_path: str, user: str = "") -> None:
+    """从该用户的上传历史里移除一条记录（按绝对路径匹配）。"""
+    hist_file = upload_hist_file_for(user)
     with _upload_hist_lock:
-        hist = load_upload_history()
+        hist = load_upload_history(user)
         kept = [h for h in hist if h.get("path") != abs_path]
         if len(kept) != len(hist):
             try:
-                UPLOAD_HISTORY_FILE.write_text(
+                hist_file.write_text(
                     json.dumps(kept[-UPLOAD_HISTORY_KEEP:], ensure_ascii=False, indent=1),
                     encoding="utf-8",
                 )
@@ -673,6 +700,120 @@ def _fs_kind(p: Path) -> str:
     return "binary"
 
 
+FS_ZIP_CONFIRM = 1024 ** 3   # 文件夹超过 1GB 前端需二次确认
+FS_SIZE_TIMEOUT = 15.0       # 统计大小最长耗时，超时按“至少 N”返回
+_zip_slots = threading.BoundedSemaphore(2)   # 同时最多 2 路打包，防止拖垮服务
+
+
+def _fs_walk(top: Path):
+    """遍历 top 下内容：不跟随软链接、不跨文件系统（避开 /proc /sys 等伪文件系统）。
+    产出 (kind, path, rel_in_top, size)：kind 为 'dir' | 'file'。目录先于其内容产出。"""
+    try:
+        dev = top.stat().st_dev
+    except OSError:
+        return
+    stack = [(top, "")]
+    while stack:
+        d, prefix = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            entries = list(it)
+        entries.sort(key=lambda e: e.name)
+        subdirs = []
+        for e in entries:
+            rel = f"{prefix}{e.name}"
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if _stat.S_ISDIR(st.st_mode):
+                if st.st_dev != dev:
+                    continue
+                yield "dir", Path(e.path), rel, 0
+                subdirs.append((Path(e.path), rel + "/"))
+            elif _stat.S_ISREG(st.st_mode):
+                yield "file", Path(e.path), rel, st.st_size
+        stack.extend(reversed(subdirs))
+
+
+def fs_dir_stats(top: Path, timeout: float = FS_SIZE_TIMEOUT) -> dict:
+    """统计文件夹：总字节、文件数、目录数；超时则 complete=False（大小为已统计部分，即“至少”）。"""
+    deadline = time.monotonic() + timeout
+    size = files = dirs = 0
+    complete = True
+    for kind, _p, _rel, sz in _fs_walk(top):
+        if kind == "dir":
+            dirs += 1
+        else:
+            files += 1
+            size += sz
+        if (files + dirs) % 256 == 0 and time.monotonic() > deadline:
+            complete = False
+            break
+    return {"size": size, "files": files, "dirs": dirs, "complete": complete}
+
+
+class _ZipSink:
+    """给 zipfile 的不可 seek 输出：直接写 socket，边压边发。"""
+    def __init__(self, wfile):
+        self._w = wfile
+        self.sent = 0
+
+    def write(self, b: bytes) -> int:
+        self._w.write(b)
+        self.sent += len(b)
+        return len(b)
+
+    def flush(self) -> None:
+        self._w.flush()
+
+
+def fs_stream_zip(top: Path, wfile) -> tuple[int, int]:
+    """把文件夹流式压成 zip 写入 wfile。返回 (文件数, 已发送字节)。
+    顶层目录名保留为压缩包内的根目录；读不了的文件直接跳过。"""
+    root_name = top.name or "root"
+    sink = _ZipSink(wfile)
+    n = 0
+    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=3, allowZip64=True) as zf:
+        zi = zipfile.ZipInfo(root_name + "/", time.localtime(top.stat().st_mtime)[:6])
+        zi.external_attr = (0o40755 << 16) | 0x10
+        zf.writestr(zi, b"")
+        for kind, path, rel, _sz in _fs_walk(top):
+            arc = f"{root_name}/{rel}"
+            if kind == "dir":
+                try:
+                    zi = zipfile.ZipInfo(arc + "/", time.localtime(path.stat().st_mtime)[:6])
+                except (OSError, ValueError):
+                    zi = zipfile.ZipInfo(arc + "/")
+                zi.external_attr = (0o40755 << 16) | 0x10
+                zf.writestr(zi, b"")
+                continue
+            try:
+                src = path.open("rb")   # 先打开：无权限的文件整条跳过，不留残缺条目
+            except OSError:
+                continue
+            with src:
+                try:
+                    zi = zipfile.ZipInfo.from_file(path, arc)
+                except (OSError, ValueError):
+                    continue
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                with zf.open(zi, "w") as dst:
+                    while True:
+                        try:
+                            chunk = src.read(UPLOAD_BLOCK)
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+            n += 1
+    return n, sink.sent
+
+
 def fs_list(rel: str) -> dict:
     """列目录：目录在前、名称不区分大小写排序；附带每项可预览类型。"""
     d = _fs_resolve(rel)
@@ -746,8 +887,39 @@ __FAVICON__
       radial-gradient(900px 500px at 100% 0%, #14352c 0%, transparent 50%),
       var(--bg);
   }
-  main { width: 100%; max-width: 2400px; margin: 0 auto; padding: 28px clamp(14px, 2vw, 36px) 72px; }
-  header { margin-bottom: 28px; }
+  .layout { display: flex; min-height: 100vh; }
+  .side {
+    width: 220px; flex: none; position: sticky; top: 0; height: 100vh;
+    display: flex; flex-direction: column; padding: 22px 14px 16px;
+    background: color-mix(in srgb, var(--panel) 92%, transparent);
+    border-right: 1px solid var(--line); backdrop-filter: blur(8px);
+  }
+  .brand { margin: 0 8px 22px; font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
+  .brand small { display: block; margin-top: 2px; font-size: 12px; font-weight: 400; color: var(--muted); letter-spacing: 0; }
+  .nav { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+  .navitem {
+    display: block; padding: 10px 12px; border-radius: 8px; color: var(--muted);
+    text-decoration: none; border-left: 3px solid transparent; cursor: pointer;
+  }
+  .navitem:hover { background: rgba(255,255,255,.05); color: var(--text); }
+  .navitem.active { background: rgba(61,139,253,.14); color: var(--text); border-left-color: var(--accent); font-weight: 600; }
+  .userbox { border-top: 1px solid var(--line); padding: 14px 8px 0; display: flex; flex-direction: column; gap: 10px; }
+  .userbox .who { color: var(--muted); font-size: 13px; word-break: break-all; }
+  .userbox .who b { color: var(--text); font-weight: 600; }
+  .userbox button { width: 100%; }
+  main { flex: 1; min-width: 0; width: 100%; max-width: 2400px; margin: 0 auto; padding: 28px clamp(14px, 2vw, 36px) 72px; }
+  .viewtitle { margin: 0 0 18px; font-size: 24px; letter-spacing: -0.02em; }
+  @media (max-width: 760px) {
+    .layout { flex-direction: column; }
+    .side { width: auto; height: auto; position: static; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; border-right: 0; border-bottom: 1px solid var(--line); }
+    .brand { margin: 0 8px 0 0; font-size: 16px; }
+    .brand small { display: none; }
+    .nav { flex-direction: row; flex: 1 1 100%; order: 3; overflow-x: auto; gap: 6px; }
+    .navitem { white-space: nowrap; border-left: 0; border-bottom: 3px solid transparent; border-radius: 6px 6px 0 0; padding: 8px 12px; }
+    .navitem.active { border-bottom-color: var(--accent); }
+    .userbox { border-top: 0; padding: 0; flex-direction: row; align-items: center; margin-left: auto; }
+    .userbox button { width: auto; padding: 6px 10px; }
+  }
   h1 { margin: 0 0 6px; font-size: 28px; letter-spacing: -0.02em; }
   .sub { color: var(--muted); }
   .card {
@@ -763,6 +935,15 @@ __FAVICON__
     border: 1px solid var(--line); border-radius: 8px;
     padding: 10px 12px; font: inherit;
   }
+  textarea.promptbox {
+    display: block; width: 100%; min-height: 520px; box-sizing: border-box; resize: vertical;
+    background: #0c1117; color: var(--text); caret-color: var(--accent);
+    border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px; line-height: 1.55; tab-size: 4;
+  }
+  textarea.promptbox:focus { outline: none; border-color: var(--accent); }
+  textarea.promptbox::selection { background: rgba(61,139,253,.4); }
   button {
     appearance: none; border: 0; cursor: pointer;
     border-radius: 8px; padding: 9px 14px; font: inherit; color: #fff;
@@ -965,15 +1146,28 @@ __FAVICON__
 </style>
 </head>
 <body>
+<div class="layout">
+<aside class="side">
+  <div class="brand">Web Terminal<small>会话管理</small></div>
+  <nav class="nav" id="nav">
+    <a class="navitem" data-view="sessions" href="#sessions">会话</a>
+    <a class="navitem" data-view="upload" href="#upload">上传</a>
+    <a class="navitem" data-view="files" href="#files">下载</a>
+    <a class="navitem" data-view="llm" href="#llm">接入 AI</a>
+    <a class="navitem" data-view="users" href="#users" id="navUsers" hidden>用户管理</a>
+  </nav>
+  <div class="userbox">
+    <span id="whoami" class="who"></span>
+    <button id="btnLogout" class="secondary" type="button" title="退出当前账号">退出登录</button>
+  </div>
+</aside>
 <main>
-  <header>
-    <h1>会话管理</h1>
-    <p class="sub">进入终端需二次验证（24 小时内免重复输入）· 新建使用默认工作目录</p>
-    <div id="trafficBar" class="trafficbar" hidden></div>
-  </header>
   <div id="flash" class="flash" hidden></div>
-  <div id="lanBar" class="lanbar" hidden></div>
 
+  <div class="view" data-view="sessions">
+    <h1 class="viewtitle">会话</h1>
+    <div id="trafficBar" class="trafficbar" hidden></div>
+    <div id="lanBar" class="lanbar" hidden></div>
   <section class="card">
     <div class="row">
       <button id="btnCreate" type="button">新建会话</button>
@@ -993,6 +1187,10 @@ __FAVICON__
     <div id="listWrap"><p class="empty">加载中…</p></div>
   </section>
 
+  </div>
+
+  <div class="view" data-view="upload" hidden>
+    <h1 class="viewtitle">上传</h1>
   <section class="card">
     <div class="row" style="justify-content:space-between;align-items:center">
       <h2 style="margin:0;font-size:16px">上传到服务器</h2>
@@ -1011,9 +1209,13 @@ __FAVICON__
     <input id="upDirInput" type="file" webkitdirectory directory multiple hidden>
   </section>
 
+  </div>
+
+  <div class="view" data-view="files" hidden>
+    <h1 class="viewtitle">下载</h1>
   <section class="card">
     <div class="row" style="justify-content:space-between;align-items:center">
-      <h2 style="margin:0;font-size:16px">服务端文件</h2>
+      <h2 style="margin:0;font-size:16px">服务端文件 <span class="sub" style="font-size:12px;font-weight:400">文件直接下载，文件夹打包为 zip</span></h2>
       <div class="actions">
         <button id="fsRefresh" class="secondary" type="button">刷新</button>
         <button id="fsUpDir" class="secondary" type="button">上一级</button>
@@ -1027,18 +1229,40 @@ __FAVICON__
     </div>
     <div id="fsList" class="fslist"><p class="empty">加载中…</p></div>
   </section>
-</main>
-
-<div id="pinModal" class="modal-mask" hidden>
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pinTitle">
-    <h3 id="pinTitle">安全验证</h3>
-    <p id="pinHint">继续操作前请完成验证</p>
-    <input id="pinInput" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" placeholder="">
-    <div class="row">
-      <button id="pinCancel" class="secondary" type="button">取消</button>
-      <button id="pinConfirm" type="button">确认进入</button>
-    </div>
   </div>
+
+  <div class="view" data-view="llm" hidden>
+    <h1 class="viewtitle">接入你的 AI</h1>
+  <section class="card">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2 style="margin:0;font-size:16px">让你的 AI 编程工具接管这个终端 <span class="sub" style="font-size:12px;font-weight:400">复制一段设置提示词，粘贴给 Claude Code / Codex / Cursor 等即可</span></h2>
+      <div class="actions">
+        <button id="llmCopy" type="button">复制设置提示词</button>
+        <button id="llmReload" class="secondary" type="button">刷新</button>
+      </div>
+    </div>
+    <p class="sub" style="margin:8px 0">内容已按当前访问地址自动填好，不含账号密码：agent 会向你索取，你直接告诉它即可。想限制权限，可让管理员在「用户管理」里为 agent 单独建一个账号。agent 会下载服务器自带的命令行工具 wt，用它执行命令、读屏、传文件；也附带了 Chrome CDP 方式。命令行工具由服务器提供且已测试，agent 直接下载使用即可。</p>
+    <textarea id="llmText" class="promptbox" readonly spellcheck="false" placeholder="加载中…"></textarea>
+  </section>
+  </div>
+
+  <div class="view" data-view="users" hidden>
+    <h1 class="viewtitle">用户管理</h1>
+  <section class="card">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2 style="margin:0;font-size:16px">用户管理</h2>
+      <div class="actions"><button id="usRefresh" class="secondary" type="button">刷新</button></div>
+    </div>
+    <div class="row" style="margin-bottom:8px">
+      <input id="usName" type="text" placeholder="新用户名（字母/数字/短横线）" maxlength="32" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <input id="usPass" type="password" placeholder="密码（至少 6 位）" maxlength="128" autocomplete="new-password">
+      <button id="usAdd" type="button">添加用户</button>
+    </div>
+    <div id="usList"><p class="empty">加载中…</p></div>
+  </section>
+
+  </div>
+</main>
 </div>
 
 <div id="nameModal" class="modal-mask" hidden>
@@ -1069,7 +1293,6 @@ __FAVICON__
 
 <script>
 const termBase = '/term/';
-let pending = null;
 let nameModalMode = null; // { type: 'create' } | { type: 'rename', oldName } | { type: 'clone', cwd, srcName }
 let cache = { sessions: [], history: [], path_root: '', default_path: '' };
 const rowSelected = new Set(); // name + \\u001e + cwd + \\u001e + live|dead
@@ -1237,6 +1460,11 @@ async function api(path, opts) {
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (res.status === 401) {
+    // 登录已过期或已登出：回登录页重新登录
+    location.href = '/';
+    throw new Error('登录已过期，请重新登录');
+  }
   if (!res.ok) {
     const err = new Error(data.error || text || res.statusText);
     err.status = res.status;
@@ -1252,28 +1480,9 @@ function openTermTab(url) {
   return w;
 }
 
-function askPin(item, hint) {
-  pending = { item: item };
-  document.getElementById('pinHint').textContent = hint || (
-    (item.create ? '新建并进入「' : '进入「') + item.name + '」前请完成验证'
-  );
-  const modal = document.getElementById('pinModal');
-  const input = document.getElementById('pinInput');
-  modal.hidden = false;
-  input.value = '';
-  setTimeout(() => input.focus(), 50);
-}
-
-function closePin() {
-  pending = null;
-  document.getElementById('pinModal').hidden = true;
-  document.getElementById('pinInput').value = '';
-}
-
-async function fetchTicketUrl(item, pin) {
+async function fetchTicketUrl(item) {
   const body = { name: item.name, create: !!item.create };
   if (item.create && item.cwd) body.cwd = item.cwd;
-  if (pin) body.pin = pin;
   const data = await api('/api/ticket', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1282,40 +1491,14 @@ async function fetchTicketUrl(item, pin) {
   return data.url;
 }
 
-async function tryOpen(item, hint) {
+async function tryOpen(item) {
   try {
-    const url = await fetchTicketUrl(item, '');
+    const url = await fetchTicketUrl(item);
     openTermTab(resolveTermUrl(url));
     flash('已在新标签打开会话');
     await refresh();
   } catch (e) {
-    if (e && e.data && e.data.need_pin) {
-      askPin(item, hint);
-      return;
-    }
     flash(String(e.message || e), true);
-  }
-}
-
-async function submitPin() {
-  if (!pending || !pending.item) return;
-  const pin = document.getElementById('pinInput').value || '';
-  if (!pin) { flash('验证失败', true); return; }
-  const item = pending.item;
-  const btn = document.getElementById('pinConfirm');
-  btn.disabled = true;
-  try {
-    const url = await fetchTicketUrl(item, pin);
-    closePin();
-    openTermTab(resolveTermUrl(url));
-    flash('已在新标签打开会话');
-    await refresh();
-  } catch (e) {
-    flash(String(e.message || e) === '需要验证' || (e.data && e.data.need_pin) ? '验证失败' : String(e.message || e), true);
-    document.getElementById('pinInput').value = '';
-    document.getElementById('pinInput').focus();
-  } finally {
-    btn.disabled = false;
   }
 }
 
@@ -1431,7 +1614,7 @@ function renderList() {
     btn.onclick = () => {
       const meta = parseRowKey(btn.getAttribute('data-open-row'));
       const item = { name: meta.name, create: !meta.live, cwd: meta.live ? '' : (meta.cwd || '') };
-      tryOpen(item, '');
+      tryOpen(item);
     };
   });
   wrap.querySelectorAll('[data-rename]').forEach(btn => {
@@ -1505,10 +1688,19 @@ function renderLanBar() {
   el.hidden = false;
 }
 
-async function refresh() {
-  const data = await api('/api/sessions');
-  cache = data;
-  const alive = new Set(mergedRows().map(rowKey));
+ async function refresh() {
+   const data = await api('/api/sessions');
+   cache = data;
+   const who = document.getElementById('whoami');
+   if (who) who.innerHTML = data.user ? ('当前用户 <b>' + esc(data.user) + '</b>') : '';
+   isAdmin = !!data.is_admin;
+   const nu = document.getElementById('navUsers');
+   if (nu) nu.hidden = !isAdmin;
+   // 普通用户停在 #users（书签/旧状态）时退回会话页
+   if (!isAdmin && currentView === 'users') showView('sessions');
+   // 刷新页面时直接停在 #users：此时才知道是否 admin，补一次加载
+   if (isAdmin && currentView === 'users' && !usersLoaded) { usersLoaded = true; loadUsers(); }
+   const alive = new Set(mergedRows().map(rowKey));
   for (const k of [...rowSelected]) {
     if (!alive.has(k)) rowSelected.delete(k);
   }
@@ -1600,7 +1792,7 @@ async function submitNameModal() {
   }
   closeNameModal();
   const cwd = (mode && mode.type === 'clone') ? (mode.cwd || cache.default_path || '') : (cache.default_path || '');
-  tryOpen({ name, create: true, cwd }, '');
+  tryOpen({ name, create: true, cwd });
 }
 
 // { scope:'session', name, cwd, live } | { scope:'global' }
@@ -1747,15 +1939,132 @@ document.getElementById('btnBulkDel').onclick = async () => {
     await refresh();
   } catch (e) { flash(String(e.message || e), true); }
 };
-document.getElementById('pinCancel').onclick = closePin;
-document.getElementById('pinConfirm').onclick = () => submitPin();
-document.getElementById('pinInput').addEventListener('keydown', (ev) => {
-  if (ev.key === 'Enter') submitPin();
-  if (ev.key === 'Escape') closePin();
-});
-document.getElementById('pinModal').addEventListener('click', (ev) => {
-  if (ev.target.id === 'pinModal') closePin();
-});
+// ---- 用户管理（仅 admin） ----
+function renderUsers(list, me) {
+  const box = document.getElementById('usList');
+  if (!list.length) { box.innerHTML = '<p class="empty">暂无用户</p>'; return; }
+  box.innerHTML = '<table style="min-width:0"><thead><tr><th>用户名</th><th style="width:110px">角色</th><th style="width:110px">运行中会话</th><th style="width:90px"></th></tr></thead><tbody>' +
+    list.map(u => '<tr><td>' + esc(u.username) + (u.username === me ? ' <span class="sub">(我)</span>' : '') + '</td>' +
+      '<td>' + (u.primary ? '管理员' : '普通用户') + '</td>' +
+      '<td>' + u.sessions + '</td>' +
+      '<td>' + (u.primary || u.username === me ? '' :
+        '<button class="danger us-del" type="button" data-u="' + esc(u.username) + '" data-n="' + u.sessions + '">删除</button>') + '</td></tr>'
+    ).join('') + '</tbody></table>';
+  box.querySelectorAll('.us-del').forEach(b => b.onclick = () => delUser(b.dataset.u, Number(b.dataset.n)));
+}
+
+async function loadUsers() {
+  try {
+    const d = await api('/api/users');
+    renderUsers(d.users || [], d.me);
+  } catch (e) {
+    document.getElementById('usList').innerHTML = '<p class="empty">' + esc(e.message || e) + '</p>';
+  }
+}
+
+async function addUser() {
+  const nameEl = document.getElementById('usName');
+  const passEl = document.getElementById('usPass');
+  const btn = document.getElementById('usAdd');
+  const username = nameEl.value.trim();
+  const password = passEl.value;
+  if (!username || !password) { flash('请输入用户名和密码', true); return; }
+  btn.disabled = true;
+  try {
+    const d = await api('/api/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    nameEl.value = ''; passEl.value = '';
+    renderUsers(d.users || [], cache.user);
+    flash('已添加用户「' + username + '」');
+  } catch (e) { flash(String(e.message || e), true); }
+  finally { btn.disabled = false; }
+}
+
+async function delUser(username, n) {
+  const extra = n ? ('\n该用户 ' + n + ' 个运行中的会话会被一并终止。') : '';
+  if (!confirm('确定删除用户「' + username + '」吗？' + extra + '\n其上传的文件会保留。')) return;
+  try {
+    const d = await api('/api/users/' + encodeURIComponent(username), { method: 'DELETE' });
+    renderUsers(d.users || [], cache.user);
+    flash('已删除用户「' + username + '」');
+    await refresh();
+  } catch (e) { flash(String(e.message || e), true); }
+}
+
+document.getElementById('usAdd').onclick = addUser;
+document.getElementById('usRefresh').onclick = loadUsers;
+document.getElementById('usPass').addEventListener('keydown', ev => { if (ev.key === 'Enter') addUser(); });
+document.getElementById('usName').addEventListener('keydown', ev => { if (ev.key === 'Enter') document.getElementById('usPass').focus(); });
+
+// ---- LLM 适配 ----
+async function loadLlmPrompt() {
+  const ta = document.getElementById('llmText');
+  try {
+    const d = await api('/api/llm-prompt');
+    ta.value = d.prompt || '';
+  } catch (e) { ta.value = ''; flash(String(e.message || e), true); }
+}
+document.getElementById('llmReload').onclick = loadLlmPrompt;
+document.getElementById('llmCopy').onclick = async () => {
+  const ta = document.getElementById('llmText');
+  if (!ta.value) await loadLlmPrompt();
+  let ok = false;
+  try { await navigator.clipboard.writeText(ta.value); ok = true; } catch (e) {}
+  if (!ok) {   // http 非安全上下文没有 clipboard API，用选中 + execCommand 兜底
+    ta.focus(); ta.select();
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    ta.setSelectionRange(0, 0);
+  }
+  const b = document.getElementById('llmCopy');
+  const old = b.textContent;
+  b.textContent = ok ? '已复制 ✓' : '复制失败，请在文本框中全选后手动复制';
+  setTimeout(() => { b.textContent = old; }, 2200);
+};
+
+// ---- 侧边栏视图切换 ----
+const VIEWS = ['sessions', 'upload', 'files', 'llm', 'users'];
+let isAdmin = false;
+let usersLoaded = false;
+let currentView = '';
+const viewLoaded = {};
+
+function showView(v, opts) {
+  if (!VIEWS.includes(v)) v = 'sessions';
+  if (v === 'users' && !isAdmin && cache && cache.user) v = 'sessions';
+  currentView = v;
+  document.querySelectorAll('.view').forEach(el => { el.hidden = el.dataset.view !== v; });
+  document.querySelectorAll('#nav .navitem').forEach(a => a.classList.toggle('active', a.dataset.view === v));
+  try { localStorage.setItem('wt_view', v); } catch (e) {}
+  if (!(opts && opts.noHash) && location.hash !== '#' + v) history.replaceState(null, '', '#' + v);
+  // 首次进入才加载，之后由各视图里的刷新按钮触发
+  if (!viewLoaded[v]) {
+    viewLoaded[v] = true;
+    if (v === 'users' && isAdmin) { usersLoaded = true; loadUsers(); }
+    if (v === 'llm') loadLlmPrompt();
+  }
+  if (v === 'sessions') window.dispatchEvent(new Event('wt-view-sessions'));
+}
+
+function initialView() {
+  const h = (location.hash || '').replace('#', '');
+  if (VIEWS.includes(h)) return h;
+  try { const v = localStorage.getItem('wt_view'); if (VIEWS.includes(v)) return v; } catch (e) {}
+  return 'sessions';
+}
+
+document.querySelectorAll('#nav .navitem').forEach(a => a.addEventListener('click', ev => {
+  ev.preventDefault();
+  showView(a.dataset.view);
+}));
+window.addEventListener('hashchange', () => showView(initialView(), { noHash: true }));
+showView(initialView(), { noHash: true });
+
+document.getElementById('btnLogout').onclick = () => {
+  if (confirm('确定退出登录吗？已打开的终端标签页不受影响，重连需重新登录。')) location.href = '/api/logout';
+};
 
 refresh().catch(e => flash(String(e.message || e), true));
 // ---- 文件上传 ----
@@ -2147,7 +2456,7 @@ refresh().catch(e => flash(String(e.message || e), true));
           '<td class="sz">' + (it.dir ? '-' : fmtSize(it.size)) + '</td>' +
           '<td class="sz">' + esc(it.mtime) + '</td>' +
           '<td class="ops">' +
-          (it.dir ? '' :
+          (it.dir ? '<button class="op2" data-act="zip">下载</button>' :
             (it.previewable ? '<button class="op2" data-act="preview">预览</button>' : '') +
             '<button class="op2" data-act="download">下载</button>') +
           '</td></tr>';
@@ -2174,7 +2483,9 @@ refresh().catch(e => flash(String(e.message || e), true));
         btn.addEventListener('click', ev => {
           ev.stopPropagation();
           const tr = btn.closest('tr');
-          if (btn.getAttribute('data-act') === 'download') doDownload(tr);
+          const act = btn.getAttribute('data-act');
+          if (act === 'download') doDownload(tr);
+          else if (act === 'zip') doZip(tr, btn);
           else doPreview(tr);
         });
       });
@@ -2193,6 +2504,37 @@ refresh().catch(e => flash(String(e.message || e), true));
     a.click();
     a.remove();
     flash('已开始下载 ' + (rel.split('/').pop() || ''));
+  }
+
+  // 文件夹下载：先统计大小，超过阈值（后端给出 confirm_over，默认 1GB）二次确认后再打包
+  async function doZip(tr, btn) {
+    const rel = tr.getAttribute('data-rel') || '';
+    const name = rel.split('/').pop() || rel;
+    const old = btn.textContent;
+    btn.disabled = true; btn.textContent = '统计中…';
+    try {
+      const st = await api('/api/fs-size?rel=' + encodeURIComponent(rel));
+      const limit = st.confirm_over || 1024 * 1024 * 1024;
+      const approx = st.complete ? '' : '至少 ';
+      const info = '「' + name + '」' + (st.complete ? '共 ' : '已统计到 ') + st.files + ' 个文件、' + st.dirs + ' 个子文件夹，' + approx + fmtSize(st.size);
+      if (!st.files) {
+        if (!confirm(info + '（空文件夹）。\n仍要下载吗？')) return;
+      } else if (!st.complete || st.size > limit) {
+        const why = st.complete ? '，超过 ' + fmtSize(limit) : '。统计超时，文件夹很大，实际体积未知';
+        if (!confirm(info + why + '。\n将压缩为 zip 后下载，耗时较长且占用服务器资源，确定继续吗？')) return;
+      }
+      const a = document.createElement('a');
+      a.href = '/api/fs-zip?rel=' + encodeURIComponent(rel);
+      a.download = name + '.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      flash('已开始下载 ' + name + '.zip（' + approx + fmtSize(st.size) + ' 压缩前）');
+    } catch (e) {
+      flash(String(e.message || e), true);
+    } finally {
+      btn.disabled = false; btn.textContent = old;
+    }
   }
 
   function closeView() {
@@ -2280,20 +2622,189 @@ refresh().catch(e => flash(String(e.message || e), true));
   load('');  // 默认根目录
 })();
 
-// 省流量：标签页不可见时停止轮询；切回前台立即刷新一次，体验不变。
-setInterval(() => {
-  if (document.hidden) return;
-  refresh().catch(() => {});
-}, 5000);
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) refresh().catch(() => {});
-});
+// 省流量：标签页不可见时停止轮询；结果无变化时逐档放慢（5→10→20→30s），
+// 列表一有变化立即回最快档；切回前台立即刷新一次，体验不变。
+;(function () {
+  var IDLE_STEPS = [5000, 10000, 20000, 30000];
+  var idleIdx = 0;
+  var lastJson = null;
+  var timer = null;
+  async function poll() {
+    if (document.hidden || currentView !== 'sessions') { timer = setTimeout(poll, IDLE_STEPS[IDLE_STEPS.length - 1]); return; }
+    try {
+      await refresh();
+      // 只对比影响渲染的关键字段：last_open 等时间戳每次都变，不能当“有变化”
+      const sig = JSON.stringify((cache.sessions || []).map(s => [s.name, s.cwd_now, s.clients, s.pages, s.last_open]));
+      if (sig !== lastJson) { lastJson = sig; idleIdx = 0; }
+      else if (idleIdx < IDLE_STEPS.length - 1) idleIdx += 1;
+    } catch (e) {}
+    timer = setTimeout(poll, IDLE_STEPS[idleIdx]);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { idleIdx = 0; clearTimeout(timer); poll(); }
+  });
+  window.addEventListener('wt-view-sessions', () => { idleIdx = 0; clearTimeout(timer); poll(); });
+  poll();
+})();
 </script>
 </body>
 </html>
 """
 
 MANAGE_HTML = MANAGE_HTML.replace("__FAVICON__", favicon_links(), 1)
+
+
+# ---------- 独立登录页：替代 Basic 弹窗（浏览器可保存密码），Cookie 登录态 24h ----------
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web Terminal · 登录</title>
+__FAVICON__
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a222c; --line: #2a3542;
+    --text: #e7ecf1; --muted: #8b9aab; --accent: #3d8bfd;
+    --danger: #f31260;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font: 14px/1.5 "IBM Plex Sans", "Source Han Sans SC", "PingFang SC", sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(1200px 600px at 10% -10%, #1b3a5f 0%, transparent 55%),
+      radial-gradient(900px 500px at 100% 0%, #14352c 0%, transparent 50%),
+      var(--bg);
+  }
+  .card {
+    width: 100%; max-width: 380px; padding: 28px 26px 24px;
+    background: color-mix(in srgb, var(--panel) 92%, transparent);
+    border: 1px solid var(--line); border-radius: 14px;
+    backdrop-filter: blur(8px);
+  }
+  h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin-bottom: 20px; }
+  label { display: block; margin: 14px 0 6px; color: var(--muted); font-size: 13px; }
+  input {
+    width: 100%; background: #0c1117; color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; font: inherit;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  .err {
+    display: none; margin: 14px 0 0; padding: 8px 12px;
+    border-radius: 8px; background: rgba(243,18,96,.12); color: #ff7aa8;
+  }
+  .err.show { display: block; }
+  button {
+    width: 100%; margin-top: 20px; appearance: none; border: 0; cursor: pointer;
+    border-radius: 8px; padding: 11px 14px; font: inherit; font-weight: 600; color: #fff;
+    background: var(--accent);
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .hint { margin-top: 16px; color: var(--muted); font-size: 12px; text-align: center; }
+</style>
+</head>
+<body>
+<form class="card" method="POST" action="/api/login" autocomplete="on">
+  <h1>Web Terminal</h1>
+  <div class="sub">登录会话管理</div>
+  <input type="hidden" name="next" value="__NEXT__">
+  <label for="username">账号</label>
+  <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" required>
+  <label for="password">密码</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <div id="err" class="err" role="alert">__ERROR__</div>
+  <button id="btn" type="submit">登 录</button>
+  <div class="hint">密码可由浏览器保存，24 小时内免再次输入</div>
+</form>
+<script>
+  // 让带错误信息的重渲染也触发浏览器“保存密码”提示的正确行为：聚焦账号框
+  (function () {
+    var e = document.getElementById('err');
+    if (e && e.textContent.trim()) e.classList.add('show');
+    var u = document.getElementById('username');
+    if (u && !u.value) u.focus();
+  })();
+</script>
+</body>
+</html>
+"""
+
+
+def render_login_html(next_url: str = "", error: str = "") -> str:
+    import html as _html
+
+    safe_next = next_url if _is_safe_next(next_url) else ""
+    out = LOGIN_HTML.replace("__FAVICON__", favicon_links(), 1)
+    out = out.replace("__NEXT__", _html.escape(safe_next, quote=True))
+    return out.replace("__ERROR__", _html.escape(error, quote=True))
+
+
+def _is_safe_next(url: str) -> bool:
+    """next 只允许：本站路径（/ 开头且非 //）或指向本机 ttyd 端口的绝对 URL。
+    防开放跳转；ttyd 与 manage 同主机不同端口，票据 URL 需要跨端口回跳。"""
+    if not url:
+        return False
+    if url.startswith("/") and not url.startswith("//"):
+        return True
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return False
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return False
+    if u.hostname not in ("127.0.0.1", "localhost") and u.hostname != PUBLIC_HOST:
+        return False
+    if u.port is not None and u.port != TTYD_PORT:
+        return False
+    return True
+
+
+def _parse_term_next(next_url: str) -> tuple[str, bool]:
+    """从 next（/term/?arg=name&arg=create&arg=t1.…&pages=N）取会话名与 create 标记。
+    返回 (name, create)；无效返回 ("", False)。"""
+    if not _is_safe_next(next_url):
+        return "", False
+    try:
+        q = parse_qs(urlparse(next_url).query)
+    except ValueError:
+        return "", False
+    name = ""
+    create = False
+    for a in q.get("arg", []):
+        if a.startswith("t1."):
+            continue
+        if a == "create":
+            create = True
+            continue
+        if not name:
+            name = a
+    if name and NAME_RE.match(name):
+        return name, create
+    return "", False
+
+
+def _strip_ticket_from_next(next_url: str) -> str:
+    """去掉 next 里的旧票据 arg，保留其余参数（name/create/pages）。"""
+    try:
+        u = urlparse(next_url)
+        q = parse_qs(u.query, keep_blank_values=True)
+    except ValueError:
+        return next_url
+    args = [a for a in q.get("arg", []) if not a.startswith("t1.")]
+    pairs: list[str] = []
+    for a in args:
+        pairs.append(("arg", a))
+    for k, vs in q.items():
+        if k == "arg":
+            continue
+        for v in vs:
+            pairs.append((k, v))
+    query = "&".join(f"{k}={quote(v, safe='')}" for k, v in pairs)
+    return u._replace(query=query).geturl()
 
 
 # ---------- 前台交互式工具识别 ----------
@@ -2352,6 +2863,208 @@ def label_process(args: str) -> dict[str, str]:
                 return {"kind": kind, "label": f"{label} {m.group(1)}", "cmd": base}
             return {"kind": kind, "label": label, "cmd": base}
     return {"kind": "other", "label": base, "cmd": base}
+
+
+# ---------- Agent 友好的终端 HTTP 接口（基于 tmux，请求/响应式，无需 WebSocket） ----------
+# exec：在会话 shell 里执行命令并等待结束，返回退出码与输出（cd/环境变量在会话内持久）
+# send：向会话发送文本/特殊键（交互程序、Ctrl-C）；screen：读取屏幕/回滚文本
+_IDLE_SHELLS = {"bash", "zsh", "sh", "dash", "-bash", "-zsh", "-sh"}
+_exec_locks: dict[str, threading.Lock] = {}
+_exec_locks_guard = threading.Lock()
+EXEC_DIR = ROOT / "run" / "exec"
+EXEC_MAX_TIMEOUT = 600.0
+EXEC_MAX_OUTPUT = 200 * 1024     # 单次返回输出上限（保留尾部）
+SEND_KEY_RE = re.compile(r"^(?:[CMS]-)*(?:[A-Za-z0-9]|Enter|Escape|Tab|BSpace|Space|Up|Down|Left|Right|Home|End|PageUp|PageDown|DC|IC|F(?:[1-9]|1[0-2]))$")
+
+
+def _tmux(*args: str, timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["tmux", *args], capture_output=True, text=True, timeout=timeout,
+        env={**os.environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+
+
+def _term_sid(internal: str) -> str:
+    return "wt-" + session_ticket.sanitize_name(internal)
+
+
+def _pane_cmd(sid: str) -> str:
+    cp = _tmux("display-message", "-p", "-t", f"{sid}:", "#{pane_current_command}")
+    return (cp.stdout or "").strip() if cp.returncode == 0 else ""
+
+
+def _capture(sid: str, scrollback: int = 0) -> str:
+    """整屏（含 scrollback 行数）纯文本；-J 把终端自动折行的行接回去。"""
+    args = ["capture-pane", "-p", "-J", "-t", f"{sid}:"]
+    if scrollback > 0:
+        args += ["-S", f"-{int(scrollback)}"]
+    cp = _tmux(*args, timeout=10)
+    if cp.returncode != 0:
+        return ""
+    return "\n".join(line.rstrip() for line in (cp.stdout or "").split("\n")).rstrip("\n")
+
+
+def _term_target(user: str, name: str, create: bool) -> tuple[str, str] | tuple[None, str]:
+    """校验并返回 (internal, sid)；失败返回 (None, 错误信息)。"""
+    name = (name or "").strip()
+    if not NAME_RE.match(name):
+        return None, "无效会话名"
+    internal = internal_name(user, name)
+    if not owns_session(user, internal):
+        return None, "无权访问该会话"
+    live = {s["name"] for s in list_sessions()}
+    if internal not in live:
+        if not create:
+            return None, "会话不存在或已停止"
+        cp = run_ctl("create", internal)
+        if cp.returncode != 0:
+            return None, (cp.stderr or cp.stdout or "create failed").strip()
+        drop_history_after_open(internal, "")
+    return internal, _term_sid(internal)
+
+
+def term_exec(sid: str, cmd: str, timeout: float) -> tuple[int, dict]:
+    """在会话 shell 中执行 cmd。返回 (http_status, body)。"""
+    fg = _pane_cmd(sid)
+    if fg and fg not in _IDLE_SHELLS:
+        return 409, {"error": "会话正忙（前台正在运行其它程序）", "foreground": fg,
+                     "hint": "用 /api/term/screen 查看，/api/term/send 发 C-c 中断，或换一个会话名"}
+    with _exec_locks_guard:
+        lock = _exec_locks.setdefault(sid, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return 409, {"error": "该会话正在执行另一条命令", "hint": "稍后重试或换会话名"}
+    tag = uuid.uuid4().hex[:10]
+    script = EXEC_DIR / f"{tag}.sh"
+    try:
+        EXEC_DIR.mkdir(parents=True, exist_ok=True)
+        script.write_text(cmd if cmd.endswith("\n") else cmd + "\n", encoding="utf-8")
+        # 回显出来的命令行里 __WT%s_%s 是被拆开的，不会被误认为真正的标记
+        line = (f"printf '\\n__WT%s_%s\\n' B {tag}; . {script}; __wt_rc=$?; "
+                f"printf '\\n__WT%s_%s_%d\\n' E {tag} $__wt_rc; rm -f {script}")
+        cp = _tmux("send-keys", "-t", f"{sid}:", "-l", line)
+        if cp.returncode != 0:
+            return 500, {"error": (cp.stderr or "send-keys failed").strip()}
+        _tmux("send-keys", "-t", f"{sid}:", "Enter")
+        begin_re = re.compile(rf"^__WTB_{tag}$", re.M)
+        end_re = re.compile(rf"^__WTE_{tag}_(\d+)$", re.M)
+        deadline = time.monotonic() + timeout
+        text = ""
+        while True:
+            text = _capture(sid, scrollback=20000)
+            m = end_re.search(text)
+            if m:
+                break
+            if _tmux("has-session", "-t", f"={sid}").returncode != 0:
+                # 命令把 shell 本身结束了（如 exit）：tmux 会话随之消失
+                return 200, {"timeout": False, "exit_code": None, "session_ended": True,
+                             "output": "", "hint": "会话已结束（命令退出了 shell）；再次 exec 同名会话会自动新建"}
+            if time.monotonic() > deadline:
+                b = begin_re.search(text)
+                part = text[b.end():] if b else text
+                return 200, {"timeout": True, "exit_code": None,
+                             "output": _trim_out(part.strip("\n")),
+                             "hint": "命令仍在运行；用 /api/term/screen 继续查看，/api/term/send 发 C-c 中断"}
+            time.sleep(0.15)
+        b = begin_re.search(text)
+        body = text[b.end():m.start()] if b else text[:m.start()]
+        return 200, {"timeout": False, "exit_code": int(m.group(1)), "output": _trim_out(body.strip("\n"))}
+    finally:
+        try:
+            script.unlink()
+        except OSError:
+            pass
+        lock.release()
+
+
+def _trim_out(out: str) -> str:
+    raw = out.encode("utf-8")
+    if len(raw) <= EXEC_MAX_OUTPUT:
+        return out
+    return "…(前面输出已截断，仅保留最后 %d KB)\n" % (EXEC_MAX_OUTPUT // 1024) + raw[-EXEC_MAX_OUTPUT:].decode("utf-8", "ignore")
+
+
+def term_send(sid: str, text: str, keys: list[str], enter: bool) -> None:
+    if text:
+        cp = _tmux("send-keys", "-t", f"{sid}:", "-l", text)
+        if cp.returncode != 0:
+            raise RuntimeError((cp.stderr or "send-keys failed").strip())
+    send_keys = list(keys) + (["Enter"] if enter else [])
+    if send_keys:
+        cp = _tmux("send-keys", "-t", f"{sid}:", *send_keys)
+        if cp.returncode != 0:
+            raise RuntimeError((cp.stderr or "send-keys failed").strip())
+
+
+WT_CLI_FILE = ROOT / "docs" / "wt.py"
+
+LLM_PROMPT_TMPL = r"""# 任务背景
+我有一台远程服务器，上面跑着 Web Terminal（基于 tmux 的网页终端）。请你（本地 AI agent）通过下面的 HTTP 接口直接操作它的终端：执行命令、读输出、操作交互程序、传输文件。不需要浏览器，也不需要 WebSocket。
+
+# 连接信息
+- 管理/API 地址: __BASE__
+- 终端页地址（仅浏览器/CDP 方式用）: __TERM__
+- 账号 / 密码: **本提示词里没有，请你开始前先向我索取**（我会直接告诉你）。拿到后只放进环境变量 `WT_USER` / `WT_PASS`，不要写进文件、日志或你对我的回复。若我说“用 CDP 方式”，则不需要账号密码，见文末。
+- 认证: 请求带 HTTP Basic（账号:密码）即可，无需先登录；wt 已内置这一步。
+
+# 第一步：安装命令行工具 wt（已测试好，直接用，不要自己重写）
+这是服务器自带的单文件 Python 3 工具（仅标准库，零依赖，内置了本站地址），免登录下载。账号密码只通过环境变量传入：
+
+    mkdir -p ~/.local/bin && curl -fsS __BASE__/api/wt-cli -o ~/.local/bin/wt && chmod +x ~/.local/bin/wt
+    export WT_USER='<我给你的账号>' WT_PASS='<我给你的密码>'
+    python3 ~/.local/bin/wt doctor
+
+（以上是 macOS/Linux 写法；Windows 请换成等价的 PowerShell 命令，如 `Invoke-WebRequest` 下载、`$env:WT_USER=...` 设变量、`python wt.py doctor` 运行，需要本机有 Python 3。）本站只提供 `http://`，不要改成 `https://`。
+
+`doctor` 会一次性自检：连通、登录、执行命令与退出码、`cd` 状态保持、读屏、清理，输出 `"ok": true` 才算装好。失败时按它给出的信息告诉我，不要自己绕路。之后统一用 `python3 ~/.local/bin/wt <子命令>`（你可以在自己的环境里建别名 `wt`，但不要改写它的实现；需要新能力先告诉我）。
+
+每个子命令输出一行 JSON；进程退出码 0=成功，3=远端命令非 0，2=超时（命令仍在运行），1=其它错误。
+
+    wt exec <会话> "<命令>" [-t 秒]          执行并等待结束，返回 {exit_code, output}
+    wt send <会话> ["文本"] [-k 键...] [--enter]   交互程序：发文本/按键，返回当前屏幕
+    wt screen <会话> [--scrollback N]        读屏幕（可带 N 行回滚）
+    wt ls | wt kill <会话>                    列出 / 结束我的会话
+    wt put <本地文件> [--rel 子路径]          上传到服务器 ~/Downloads
+    wt files [相对路径] | wt get <服务端相对路径> [-o 本地]   浏览 / 下载（目录自动打包 zip）
+    wt doctor                                 自检
+
+# 使用要点（均已实测）
+0. **你自己的工具超时**：`wt exec -t N` 是服务器侧等待上限，要小于你自己 shell 工具的超时；预计超过一两分钟的任务，一律后台运行再轮询。
+1. **会话**：会话名建议统一加前缀 `agent-`（如 `agent-build`），我在网页里能看到并旁观你的会话，也方便和我自己的会话区分。用名字标识（字母/数字/中文/下划线/短横线，≤64）。`exec`/`send` 对不存在的会话会自动创建；同名会话复用同一个 shell，所以 `cd`、`export`、虚拟环境在多次 `exec` 之间保持。建议为不同任务用不同会话名，用完 `kill` 自己建的会话，不要动不带 `agent-` 前缀的会话。
+2. **exec 语义**：命令在会话 shell 里执行，返回真实退出码和纯文本输出（已去掉提示符和转义序列），可含多行、引号、中文。单次输出超过 200KB 只保留尾部。默认超时 60 秒，最大 600 秒。
+3. **长任务/超时**：超时返回 `timeout:true`，命令仍在后台运行。这时用 `screen` 看进度，等它结束，或用 `send -k C-c` 中断。会话还在运行前台程序时再次 `exec` 会得到 HTTP 409（会话正忙），不会把命令塞进别人的输入里。长时间任务建议 `nohup cmd > log 2>&1 &` 后轮询日志。
+4. **交互程序**（python REPL、vim、ssh、安装向导）：先用 `exec` 或 `send` 启动，再用 `send "文本" --enter` 输入，`send -k Up Enter Escape C-c C-d F5` 发按键，用返回的 `screen` 判断状态。键名为 tmux 键名。用 `C-d` 退出 REPL 后会话恢复可 `exec`。
+5. **命令把 shell 退出了**（如 `exit`）：返回 `session_ended:true`，再次 `exec` 同名会话会自动新建。
+6. **文件**：上传用 `put`；下载/浏览用 `files`/`get`。浏览范围是整台服务器磁盘；文件夹下载是 zip 流式打包，统计和打包大文件夹会比较慢。`wt put` 只传文件（目录先打包），同名会自动改名不覆盖；`wt get` 默认不覆盖本地已有文件。不要读取或回传凭据类文件。
+7. **多用户**：每个账号只能看到并操作自己的会话。
+
+# 原始接口（仅当 wt 不可用时才自己调用；wt 即对它们的封装）
+- `POST __BASE__/api/term/exec`  JSON `{"name":"w1","cmd":"ls -la","timeout":60}` → `{"exit_code":0,"output":"...","timeout":false}`；会话忙返回 409
+- `POST __BASE__/api/term/send`  JSON `{"name":"w1","text":"print(1)","keys":["C-c"],"enter":true,"wait":0.8}` → `{"foreground":"python3","screen":"..."}`
+- `GET  __BASE__/api/term/screen?name=w1&scrollback=200` → `{"screen":"...","foreground":"bash"}`
+- `GET  __BASE__/api/sessions` 列会话；`DELETE __BASE__/api/sessions/<名>` 结束会话
+- `POST __BASE__/api/upload?rel=<子路径>` 请求体为文件原始字节
+- `GET  __BASE__/api/fs-list?rel=<相对路径>`、`/api/fs-download?rel=`、`/api/fs-zip?rel=`（文件夹）、`/api/fs-size?rel=`
+
+# 可选：不走 HTTP 接口，直接驱动浏览器里的终端（Chrome CDP）
+适用：我已经在 Chrome 里登录了这个站点，你想操作我眼前那个标签页（或需要看到真实渲染的屏幕）。
+1. 让我用 `--remote-debugging-port=9222` 启动 Chrome，你通过 CDP 连接（Playwright `connectOverCDP` 或原生 CDP 均可）。
+2. 在管理页（__BASE__/ ，同源已带登录 Cookie）里执行 `fetch('/api/ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'会话名',create:true})}).then(r=>r.json())`，拿到 `url`（形如 `/term/?arg=会话名&arg=t1.…`）。票据 12 小时有效，只对该会话名有效。
+3. 在新标签页打开 `__TERM__` + 该 url（注意终端在另一个端口，管理页相对路径不能直接用）。等 `window.term` 出现。
+4. 读屏：`window.term.buffer.active` 逐行 `getLine(i).translateToString(true)`，行数 = `buffer.active.length`。
+5. 输入（实测）：`window.term.paste('命令')` 然后用 CDP 真实按键发送 `Enter`；单靠 `paste('…\r')` 或 `paste('…\n')` 不会执行。中文/引号可用 `Input.insertText` 或 `keyboard.insertText` 再按 `Enter`。`Ctrl+C` 用真实按键。`term.input` 在此版本不存在。
+6. 页面是 xterm.js；终端与服务器之间走 WebSocket（子协议必须是 `tty`，首帧 JSON `{"AuthToken":"","columns":N,"rows":N}`，其后每帧首字节是类型：发送 `0`=输入 `1`=改尺寸，接收 `0`=输出 `1`=标题 `2`=偏好）。你通常不需要直接碰它，用上面的 HTTP 接口或 `window.term` 即可。仅当前两条都不可用时才自己实现这个协议（公网只提供 ws://，不提供 wss://）。
+
+# 约束
+- 优先级：wt > CDP > 原始接口/WebSocket。
+- 每次操作前想清楚：`exec` 是同步等待的，命令可能阻塞；不确定会不会结束的命令请加 `-t` 或放后台。
+- 删除/覆盖文件、重启服务、`kill` 进程等破坏性操作，先向我确认。
+- 密码只通过环境变量 `WT_PASS` 使用，不要写进你生成的脚本、文件、日志或对我的回复里；不要把密码作为命令行参数传递。
+"""
+
+
+def render_llm_prompt(base: str, term: str) -> str:
+    """提示词里不含任何账号密码：由用户自己告诉 agent。"""
+    return LLM_PROMPT_TMPL.replace("__BASE__", base).replace("__TERM__", term)
 
 
 def tmux_pane(sid: str) -> dict[str, str]:
@@ -2441,6 +3154,83 @@ def list_sessions() -> list[dict]:
             }
         )
     return sessions
+
+
+NAME_SEP = "__"
+
+
+def primary_user() -> str:
+    """主用户名：users.json 首个，否则 .env 的 TTYD_USER。"""
+    users = all_users()
+    return next(iter(users), USER)
+
+
+def is_primary(user: str) -> bool:
+    return user == primary_user()
+
+
+def internal_name(user: str, name: str) -> str:
+    """用户视角名 → 内部会话名：主用户原名，其他用户 <user>__<name>。
+    幂等：传入已是自己命名空间的内部名（带自己前缀）则原样返回——
+    终端页 URL arg / 票据里存的就是内部名，manage 页传的是显示名。"""
+    if is_primary(user):
+        return name
+    prefix = f"{user}{NAME_SEP}"
+    if name.startswith(prefix):
+        return name
+    return f"{prefix}{name}"
+
+
+def display_name(user: str, internal: str) -> str:
+    """内部名 → 展示名：其他用户剥掉自己的前缀（别人的连别人的前缀都不剩）。"""
+    if is_primary(user):
+        return internal
+    prefix = f"{user}{NAME_SEP}"
+    if internal.startswith(prefix):
+        return internal[len(prefix):]
+    return internal
+
+
+def owns_session(user: str, internal: str) -> bool:
+    """internal 是否属于 user：主用户=无别人的前缀；其他用户=带自己前缀。"""
+    p = primary_user()
+    if user == p:
+        return not any(internal.startswith(f"{u}{NAME_SEP}") for u in all_users() if u != p)
+    return internal.startswith(f"{user}{NAME_SEP}")
+
+
+def filter_sessions_for(user: str, sessions: list[dict]) -> list[dict]:
+    out = []
+    for s in sessions:
+        internal = str(s.get("name") or "")
+        if owns_session(user, internal):
+            out.append({**s, "name": display_name(user, internal)})
+    return out
+
+
+def filter_history_for(user: str, items: list[dict]) -> list[dict]:
+    out = []
+    for it in items:
+        internal = str(it.get("name") or "")
+        if owns_session(user, internal):
+            out.append({**it, "name": display_name(user, internal)})
+    return out
+
+
+def filter_traffic_for(user: str, summary: dict) -> dict:
+    """流量摘要按会话名前缀过滤。"""
+    p = primary_user()
+    out: dict = {}
+    for k, v in summary.items():
+        if k in ("today", "total"):
+            out[k] = dict(v) if isinstance(v, dict) else v
+            continue
+        if user == p:
+            if not any(str(k).startswith(f"{u}{NAME_SEP}") for u in all_users() if u != p):
+                out[k] = v
+        elif str(k).startswith(f"{user}{NAME_SEP}"):
+            out[f"{user}{NAME_SEP}{display_name(user, str(k))}"] = v
+    return out
 
 
 def list_history(exclude_live: bool = True) -> list[dict]:
@@ -2542,6 +3332,116 @@ def parse_cookies(header: str) -> dict[str, str]:
         k, v = part.split("=", 1)
         out[k.strip()] = v.strip()
     return out
+
+
+# ---- 登录会话 Cookie（wt_auth）：替代 Basic 弹窗，表单登录后 24h 免输 ----
+AUTH_COOKIE = "wt_auth"
+LOGOUT_COOKIE = "wt_out"
+AUTH_TTL_SEC = 24 * 3600
+# 多用户：users.json 首个为主用户（无前缀，兼容旧会话/书签），其余用户会话名带 <user>__ 前缀
+
+
+def all_users() -> dict[str, dict]:
+    return session_ticket.load_users()
+
+
+def find_user(username: str) -> dict | None:
+    u = all_users().get(username)
+    if u and u.get("password"):
+        return u
+    return None
+
+
+# ---------- 登录失败限速（防暴力猜密码）----------
+# 按“来源 IP”和“账号名”两个维度各自计数：窗口内失败达上限即锁定，锁定期内连正确密码也拒绝，
+# 成功登录清零。IP 取 TCP 对端地址（本服务直连，不信任 X-Forwarded-For，防伪造绕过）。
+LOGIN_FAIL_WINDOW = float(ENV.get("LOGIN_FAIL_WINDOW", "600"))     # 统计窗口（秒）
+LOGIN_FAIL_MAX_IP = int(ENV.get("LOGIN_FAIL_MAX_IP", "10"))        # 单 IP 窗口内最多失败次数
+LOGIN_FAIL_MAX_USER = int(ENV.get("LOGIN_FAIL_MAX_USER", "30"))    # 单账号窗口内最多失败次数（跨 IP 合计）
+LOGIN_LOCK_SEC = float(ENV.get("LOGIN_LOCK_SEC", "900"))           # 锁定时长（秒）
+_FAIL_LOCK = threading.Lock()
+_FAILS: dict[str, list[float]] = {}     # key -> 失败时间戳
+_LOCKED: dict[str, float] = {}          # key -> 解锁时间
+_FAILS_MAX_KEYS = 20000                 # 防被灌爆内存
+
+
+def _fail_keys(ip: str, username: str) -> tuple[str, str]:
+    return "ip:" + ip, "u:" + username.lower()[:64]
+
+
+def login_lock_remaining(ip: str, username: str) -> int:
+    """被锁定则返回剩余秒数，否则 0。"""
+    now = time.time()
+    with _FAIL_LOCK:
+        left = 0.0
+        for k in _fail_keys(ip, username):
+            until = _LOCKED.get(k, 0)
+            if until > now:
+                left = max(left, until - now)
+            elif k in _LOCKED:
+                del _LOCKED[k]
+        return int(left) + 1 if left else 0
+
+
+def login_record_failure(ip: str, username: str) -> None:
+    now = time.time()
+    k_ip, k_user = _fail_keys(ip, username)
+    with _FAIL_LOCK:
+        if len(_FAILS) > _FAILS_MAX_KEYS:   # 清掉过期的，仍超则丢弃最旧的
+            for k in [k for k, v in _FAILS.items() if not v or now - v[-1] > LOGIN_FAIL_WINDOW]:
+                _FAILS.pop(k, None)
+            while len(_FAILS) > _FAILS_MAX_KEYS:
+                _FAILS.pop(next(iter(_FAILS)), None)
+        for k, limit in ((k_ip, LOGIN_FAIL_MAX_IP), (k_user, LOGIN_FAIL_MAX_USER)):
+            lst = [t for t in _FAILS.get(k, []) if now - t <= LOGIN_FAIL_WINDOW]
+            lst.append(now)
+            _FAILS[k] = lst
+            if len(lst) >= limit:
+                _LOCKED[k] = now + LOGIN_LOCK_SEC
+                _FAILS[k] = []
+                sys.stderr.write(f"[auth] 锁定 {k} {int(LOGIN_LOCK_SEC)}s（窗口内失败 {len(lst)} 次）\n")
+
+
+def login_record_success(ip: str, username: str) -> None:
+    with _FAIL_LOCK:
+        # 只清该 IP 和该账号的失败计数；不解除已生效的锁（锁定期内本来就不会走到这里）
+        for k in _fail_keys(ip, username):
+            _FAILS.pop(k, None)
+
+
+def check_user_password(username: str, password: str) -> bool:
+    if username == USER and password == PASSWORD:
+        # Basic/旧配置的主用户（users.json 未配置时 .env 即主用户）
+        return True
+    u = find_user(username)
+    return bool(u) and hmac.compare_digest(password, u["password"])
+
+
+def issue_auth_token(user: str) -> tuple[str, int]:
+    """返回 (token, max_age_seconds)，绑定用户（a3.<user>.<exp>.<sig>）。"""
+    exp = int(time.time()) + AUTH_TTL_SEC
+    msg = f"auth:{user}:{exp}".encode("utf-8")
+    sig = hmac.new(session_ticket.user_secret(user, ENV), msg, hashlib.sha256).hexdigest()[:32]
+    return f"a3.{user}.{exp}.{sig}", AUTH_TTL_SEC
+
+
+def verify_auth_token(token: str) -> str | None:
+    """返回用户名；无效/过期返回 None。"""
+    parts = (token or "").split(".")
+    if len(parts) != 4 or parts[0] != "a3":
+        return None
+    _, user, exp_s, sig = parts
+    if user != USER and not find_user(user):
+        return None
+    try:
+        exp = int(exp_s)
+    except ValueError:
+        return None
+    if exp < int(time.time()):
+        return None
+    msg = f"auth:{user}:{exp_s}".encode("utf-8")
+    expect = hmac.new(session_ticket.user_secret(user, ENV), msg, hashlib.sha256).hexdigest()[:32]
+    return user if hmac.compare_digest(expect, sig) else None
 
 
 def cleanup_paste_images(max_age_sec: int = 86400, keep_newest: int = 40) -> None:
@@ -2659,20 +3559,34 @@ def save_paste_image(
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "WebTerminalManage/1.0"
+    # 当前请求归属用户（登录 Cookie/Basic 解析出；默认主用户）
+    wt_user: str = USER
 
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
     def _unauthorized(self) -> None:
+        left, self._basic_locked = getattr(self, "_basic_locked", 0), 0   # 用后即清，避免 keep-alive 连接残留
+        if left:
+            self._json(429, {"error": f"登录失败次数过多，已被临时锁定，请约 {(left + 59) // 60} 分钟后再试", "retry_after": left},
+                       [("Retry-After", str(left))])
+            return
+        # 不再发 WWW-Authenticate：Basic 弹窗无法保存密码、且跨端口重复弹。
+        # curl/脚本仍可用 -u（_basic_ok 静默接受）；未登录浏览器由 / 的登录页承接。
         self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Web Terminal"')
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"Unauthorized")
 
     def _basic_ok(self) -> bool:
+        """Basic 认证（curl/脚本兼容）。凭据正确时记录用户名供后续过滤。"""
         hdr = self.headers.get("Authorization", "")
         if not hdr.startswith("Basic "):
+            return False
+        # 已点“退出登录”的浏览器带 wt_out 标记：忽略它缓存的 Basic 凭据，
+        # 否则清掉登录 Cookie 后仍会被当作已登录。重新登录时清除标记。
+        # curl/脚本不带该 Cookie，不受影响。
+        if parse_cookies(self.headers.get("Cookie", "")).get(LOGOUT_COOKIE):
             return False
         try:
             raw = base64.b64decode(hdr[6:].encode("ascii")).decode("utf-8")
@@ -2681,27 +3595,64 @@ class Handler(BaseHTTPRequestHandler):
         if ":" not in raw:
             return False
         u, p = raw.split(":", 1)
-        return u == USER and p == PASSWORD
-
-    def _check_auth(self) -> bool:
-        if self._basic_ok():
+        self._basic_locked = 0
+        ip = self.client_address[0]
+        left = login_lock_remaining(ip, u)
+        if left:
+            self._basic_locked = left   # 锁定期内不校验（连正确密码也拒绝），由 _unauthorized 给出 429
+            return False
+        if check_user_password(u, p):
+            login_record_success(ip, u)
+            self.wt_user = u
             return True
-        self._unauthorized()
+        login_record_failure(ip, u)
         return False
 
-    def _check_auth_or_unlock(self) -> bool:
-        """终端页粘贴图片：Basic（浏览器缓存）或 PIN unlock Cookie 均可。"""
-        if self._basic_ok() or self._has_valid_unlock():
+    def _has_valid_auth(self) -> bool:
+        """登录态：wt_auth Cookie（表单登录 24h）或 Basic（curl/脚本）。
+        通过后 self.wt_user 为当前用户名（Basic 优先，其次 cookie 绑定的用户）。"""
+        if self._basic_ok():
+            return True
+        cookies = parse_cookies(self.headers.get("Cookie", ""))
+        user = verify_auth_token(cookies.get(AUTH_COOKIE, ""))
+        if user:
+            self.wt_user = user
+            return True
+        return False
+
+    def _auth_cookie_header(self, user: str) -> str:
+        token, max_age = issue_auth_token(user)
+        # 不强制 Secure：本机 http://127.0.0.1 也可用；公网 HTTPS 下 SameSite=Lax 足够
+        return (
+            f"{AUTH_COOKIE}={token}; Path=/; Max-Age={max_age}; "
+            f"HttpOnly; SameSite=Lax"
+        )
+
+    def _check_auth(self) -> bool:
+        if self._has_valid_auth():
             return True
         self._unauthorized()
         return False
 
     def _send(self, code: int, body: bytes, content_type: str, extra_headers: list[tuple[str, str]] | None = None) -> None:
+        headers = list(extra_headers or [])
+        # 跨境裸 HTTP 很慢：文本类响应 >4KB 且客户端支持时 gzip（大页面省 70%+）
+        if (
+            code == 200
+            and ("text/html" in content_type or "application/json" in content_type or "text/plain" in content_type)
+            and len(body) > 4096
+            and "gzip" in (self.headers.get("Accept-Encoding") or "")
+        ):
+            gz = gzip.compress(body, 6)
+            if len(gz) < len(body):
+                body = gz
+                headers.append(("Content-Encoding", "gzip"))
+                headers.append(("Vary", "Accept-Encoding"))
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        for k, v in extra_headers or []:
+        for k, v in headers:
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
@@ -2710,37 +3661,13 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self._send(code, body, "application/json; charset=utf-8", extra_headers)
 
-    def _html(self, code: int, html: str) -> None:
+    def _html(self, code: int, html: str, extra_headers: list[tuple[str, str]] | None = None) -> None:
         body = html.encode("utf-8")
-        self._send(code, body, "text/html; charset=utf-8")
+        self._send(code, body, "text/html; charset=utf-8", extra_headers)
 
     def _binary(self, code: int, body: bytes, ctype: str) -> None:
         # 图标可长缓存：内容随发布变化时页面里的 data URI 才是主路径
         self._send(code, body, ctype, [("Cache-Control", "public, max-age=86400")])
-
-    def _unlock_cookie_header(self) -> str:
-        token, max_age = session_ticket.issue_unlock(ENV)
-        # 不强制 Secure：本机 http://127.0.0.1 也可用；公网 HTTPS 下 SameSite=Lax 足够
-        return (
-            f"{session_ticket.UNLOCK_COOKIE}={token}; Path=/; Max-Age={max_age}; "
-            f"HttpOnly; SameSite=Lax"
-        )
-
-    def _has_valid_unlock(self) -> bool:
-        cookies = parse_cookies(self.headers.get("Cookie", ""))
-        return session_ticket.verify_unlock(cookies.get(session_ticket.UNLOCK_COOKIE, ""), ENV)
-
-    def _authorize_pin_or_unlock(self, pin: str) -> tuple[bool, list[tuple[str, str]]]:
-        """PIN 正确或 Cookie 未过期则放行；PIN 正确时刷新 24h Cookie。"""
-        headers: list[tuple[str, str]] = []
-        if pin:
-            if not session_ticket.check_pin(pin, ENV):
-                return False, []
-            headers.append(("Set-Cookie", self._unlock_cookie_header()))
-            return True, headers
-        if self._has_valid_unlock():
-            return True, []
-        return False, []
 
     def _lan_cors_headers(self) -> list[tuple[str, str]]:
         """局域网直连时终端页在 ttyd 端口，粘贴图片是跨源请求。
@@ -2784,21 +3711,121 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def do_GET(self) -> None:  # noqa: N802
-        if not self._check_auth():
+    def _redirect(self, location: str, cookies: list[str] | None = None) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        for c in cookies or []:
+            self.send_header("Set-Cookie", c)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _enter_target(self, qs: dict[str, list[str]]) -> tuple[str, str, bool]:
+        """/enter 的目标：next（完整终端 URL）或 name 参数。返回 (next_url, name, create)。"""
+        next_url = (qs.get("next") or [""])[0]
+        if next_url:
+            name, create = _parse_term_next(next_url)
+            if name:
+                return next_url, name, create
+            return "", "", False
+        name = (qs.get("name") or [""])[0].strip()
+        create = bool((qs.get("create") or [""])[0])
+        if name and NAME_RE.match(name):
+            return "", name, create
+        return "", "", False
+
+    def _issue_enter_redirect(self, next_url: str, name: str, create: bool, user: str = "") -> None:
+        """已登录：签发票据并 302 回终端页（票据绑定该用户命名空间）。"""
+        internal = internal_name(user, name)
+        if create:
+            live = {s["name"] for s in list_sessions()}
+            if internal not in live:
+                cp = run_ctl("create", internal)
+                if cp.returncode != 0:
+                    self._json(400, {"error": (cp.stderr or cp.stdout or "create failed").strip()})
+                    return
+                drop_history_after_open(internal, "")
+        try:
+            ticket = session_ticket.issue(internal, create=False, env=ENV)
+        except ValueError as e:
+            self._json(500, {"error": str(e)})
             return
+        if next_url:
+            base = _strip_ticket_from_next(next_url)
+            sep = "&" if "?" in base else "?"
+            target = f"{base}{sep}arg={quote(ticket, safe='')}"
+        else:
+            target = term_url(internal, ticket)
+        self._redirect(target)
+
+    def _handle_enter(self, qs: dict[str, list[str]]) -> None:
+        """/enter：终端页无票据时的入口。已登录 → 直接发票据跳回；未登录 → 登录页。"""
+        next_url, name, create = self._enter_target(qs)
+        if not name:
+            # 没有可进的会话名：当作普通登录页
+            self._redirect("/")
+            return
+        if not self._has_valid_auth():
+            self._html(200, render_login_html(next_url or term_url(name, "")))
+            return
+        self._issue_enter_redirect(next_url, name, create, self.wt_user)
+
+    def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        qs = parse_qs(parsed.query)
 
-        if path in ("/", "/manage"):
+        # 登录页与票据入口不走 _check_auth：未登录时由页面承接，而非 401
+        if path in ("/", "/manage", "/login"):
+            if not self._has_valid_auth():
+                next_url = (qs.get("next") or [""])[0]
+                self._html(200, render_login_html(next_url))
+                return
+            if path == "/login":
+                next_url = (qs.get("next") or [""])[0]
+                if _is_safe_next(next_url):
+                    self.send_response(302)
+                    self.send_header("Location", next_url)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self._html(200, MANAGE_HTML)
             return
+
+        if path == "/enter":
+            self._handle_enter(qs)
+            return
+
+        if path == "/api/wt-cli":   # 命令行工具本身不含机密，免登录下发，地址按访问来源内置
+            host = (self.headers.get("Host") or "").split(":")[0] or PUBLIC_HOST
+            try:
+                body = WT_CLI_FILE.read_text("utf-8").replace("__WT_DEFAULT_URL__", f"http://{host}:{MANAGE_PORT}")
+                self._send(200, body.encode("utf-8"), "text/x-python; charset=utf-8",
+                           [("Content-Disposition", 'attachment; filename="wt.py"'), ("Cache-Control", "no-store")])
+            except OSError:
+                self._json(404, {"error": "wt.py 不存在"})
+            return
+
+        if not self._check_auth():
+            return
+
+        if path == "/api/users":
+            if not is_primary(self.wt_user):
+                self._json(403, {"error": "仅管理员可管理用户"})
+                return
+            self._json(200, {"users": list_users_info(), "me": self.wt_user})
+            return
         if path == "/api/sessions":
+            user = self.wt_user
             self._json(
                 200,
                 {
-                    "sessions": list_sessions(),
-                    "history": list_history(),
+                    "sessions": filter_sessions_for(user, list_sessions()),
+                    "history": filter_history_for(user, list_history()),
                     "path_root": PATH_ROOT,
                     "default_path": DEFAULT_PATH,
                     "default_pages": default_pages(),
@@ -2811,6 +3838,9 @@ class Handler(BaseHTTPRequestHandler):
                     "term_base": TTYD_BASE_PATH + "/",
                     "public_host": PUBLIC_HOST,
                     "traffic": traffic_summary(),
+                    "user": user,
+                    "multi_user": bool(all_users()),
+                    "is_admin": is_primary(user),
                 },
             )
             return
@@ -2826,13 +3856,37 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 self._json(404, {"error": "no icon"})
             return
+        if path == "/api/llm-prompt":
+            host = (self.headers.get("Host") or "").split(":")[0] or PUBLIC_HOST
+            base = f"http://{host}:{MANAGE_PORT}"
+            term = f"http://{host}:{TTYD_PORT}"
+            self._json(200, {"prompt": render_llm_prompt(base, term)})
+            return
+        if path == "/api/term/screen":
+            q = parse_qs(parsed.query)
+            internal, sid = _term_target(self.wt_user, (q.get("name") or [""])[0], create=False)
+            if internal is None:
+                self._json(404 if "不存在" in sid else 400, {"error": sid})
+                return
+            try:
+                lines = max(0, min(int((q.get("scrollback") or ["0"])[0]), 50000))
+            except ValueError:
+                lines = 0
+            text = _capture(sid, scrollback=lines)
+            self._json(200, {"name": (q.get("name") or [""])[0], "foreground": _pane_cmd(sid),
+                             "screen": _trim_out(text)})
+            return
         if path == "/api/foreground":
             cors = self._lan_cors_headers()
             name = (parse_qs(parsed.query).get("name") or [""])[0].strip()
             if not NAME_RE.match(name):
                 self._json(400, {"error": "无效会话名"}, cors)
                 return
-            sid = "wt-" + session_ticket.sanitize_name(name)
+            internal = internal_name(self.wt_user, name)
+            if not owns_session(self.wt_user, internal):
+                self._json(403, {"error": "无权访问该会话"}, cors)
+                return
+            sid = "wt-" + session_ticket.sanitize_name(internal)
             try:
                 info = foreground_process(sid)
             except (OSError, subprocess.SubprocessError):
@@ -2855,16 +3909,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/traffic":
             qs = parse_qs(parsed.query)
             name = (qs.get("name") or [""])[0].strip()
-            self._json(200, traffic_summary(name), self._lan_cors_headers())
+            # 显示名/内部名统一映射后查询（wt_user 由登录态解析）
+            internal = internal_name(self.wt_user, name)
+            if name and not owns_session(self.wt_user, internal):
+                self._json(403, {"error": "无权访问该会话"}, self._lan_cors_headers())
+                return
+            self._json(200, traffic_summary(internal), self._lan_cors_headers())
             return
         if path == "/api/upload-history":
-            self._json(200, {"history": prune_upload_history()})
+            self._json(200, {"history": prune_upload_history(self.wt_user)})
             return
         if path == "/api/upload-download":
             qs = parse_qs(parsed.query)
             rel = unquote((qs.get("rel") or [""])[0]).strip()
             try:
-                dest = _resolve_upload_rel(rel)
+                dest = _resolve_upload_rel(rel, self.wt_user)
             except ValueError as e:
                 self._json(400, {"error": str(e)})
                 return
@@ -2965,6 +4024,48 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as e:
                 self._json(500, {"error": str(e)})
             return
+        if path in ("/api/fs-size", "/api/fs-zip"):
+            rel = unquote((parse_qs(parsed.query).get("rel") or [""])[0]).strip()
+            try:
+                top = _fs_resolve(rel)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            if top == FS_ROOT:
+                self._json(400, {"error": "不能打包整个根目录，请进入具体文件夹"})
+                return
+            if not top.is_dir():
+                self._json(404, {"error": "文件夹不存在"})
+                return
+            if not os.access(top, os.R_OK | os.X_OK):
+                self._json(403, {"error": "无权访问该文件夹"})
+                return
+            if path == "/api/fs-size":
+                st = fs_dir_stats(top)
+                self._json(200, {**st, "confirm_over": FS_ZIP_CONFIRM, "name": top.name})
+                return
+            if not _zip_slots.acquire(blocking=False):
+                self._json(429, {"error": "当前打包任务较多，请稍后再试"})
+                return
+            try:
+                quoted = quote(top.name + ".zip")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")   # 无 Content-Length：以关闭连接结束
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    n, sent = fs_stream_zip(top, self.wfile)
+                    sys.stderr.write(f"[fs] zip {rel} ({n} files, {sent} bytes)\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    sys.stderr.write(f"[fs] zip {rel} 客户端中断\n")
+                except OSError as e:
+                    sys.stderr.write(f"[fs] zip {rel} 失败: {e}\n")
+            finally:
+                _zip_slots.release()
+            return
         if path == "/api/fs-download":
             rel = unquote((parse_qs(parsed.query).get("rel") or [""])[0]).strip()
             try:
@@ -3001,8 +4102,11 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             sys.stderr.write(f"[fs] download {rel} ({size} bytes)\n")
             return
-        if path == "/api/unlock":
-            self._json(200, {"ok": self._has_valid_unlock()})
+        if path == "/api/logout":
+            # 清登录 Cookie（顺带清旧版 PIN 解锁 Cookie）后回登录页
+            kill = lambda name: f"{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+            out = f"{LOGOUT_COOKIE}=1; Path=/; Max-Age=604800; HttpOnly; SameSite=Lax"
+            self._redirect("/", [kill(AUTH_COOKIE), kill("wt_pin_ok"), out])
             return
         self._json(404, {"error": "not found"})
 
@@ -3010,6 +4114,8 @@ class Handler(BaseHTTPRequestHandler):
         """POST /api/upload?rel=<相对路径>&overwrite=1  请求体=原始文件字节流。
         文件夹上传由前端拆成多个请求逐文件发送，rel 保留目录结构。
         默认同名自动改名不覆盖；overwrite=1 时覆盖历史记录指向的既有文件。"""
+        if not self._check_auth():
+            return
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         rel = unquote((qs.get("rel") or [""])[0]).strip()
@@ -3021,9 +4127,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             if overwrite:
-                dest, written = overwrite_upload_stream(rel, length, self.rfile)
+                dest, written = overwrite_upload_stream(rel, length, self.rfile, self.wt_user)
             else:
-                dest, written = save_upload_stream(rel, length, self.rfile)
+                dest, written = save_upload_stream(rel, length, self.rfile, self.wt_user)
         except ValueError as e:
             self._json(400, {"error": str(e)})
             return
@@ -3035,21 +4141,100 @@ class Handler(BaseHTTPRequestHandler):
             return
         rel_out = str(dest.relative_to(UPLOAD_DIR))
         sys.stderr.write(f"[upload] {rel_out} ({written} bytes)\n")
-        self._json(200, {"ok": True, "path": str(dest), "rel": rel_out, "bytes": written, "history": prune_upload_history()})
+        self._json(200, {"ok": True, "path": str(dest), "rel": rel_out, "bytes": written, "history": prune_upload_history(self.wt_user)})
 
     def _handle_batch(self) -> None:
         """POST /api/upload-batch：为一批上传创建独立子目录，返回相对目录名。"""
         try:
-            d = new_upload_batch_dir()
+            d = new_upload_batch_dir(self.wt_user)
         except (OSError, RuntimeError) as e:
             self._json(500, {"error": str(e)})
             return
         sys.stderr.write(f"[upload] batch dir {d.name}\n")
         self._json(200, {"ok": True, "dir": d.name, "path": str(d)})
 
+    def _read_body(self) -> dict[str, str]:
+        """读取请求体为 dict：兼容表单（登录页原生 POST）与 JSON（脚本调用）。"""
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length) if length else b""
+        ctype = self.headers.get("Content-Type", "")
+        if "application/json" in ctype:
+            try:
+                data = json.loads(raw.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                data = {}
+            return {k: str(v) for k, v in data.items()}
+        try:
+            form = parse_qs(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            return {}
+        return {k: (v[0] if v else "") for k, v in form.items()}
+
+    def _handle_login(self) -> None:
+        """POST /api/login：校验账号密码，种登录 Cookie；
+        有 next（终端 URL）时直接签发票据跳回，否则回管理页。"""
+        data = self._read_body()
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
+        next_url = data.get("next") or ""
+        wants_json = "application/json" in (self.headers.get("Content-Type") or "")
+
+        def fail(error: str):
+            if wants_json:
+                self._json(401, {"error": error})
+            else:
+                self._html(401, render_login_html(next_url, error))
+
+        ip = self.client_address[0]
+        left = login_lock_remaining(ip, username)
+        if left:
+            mins = (left + 59) // 60
+            self._json(429, {"error": f"登录失败次数过多，请约 {mins} 分钟后再试", "retry_after": left}, [("Retry-After", str(left))]) \
+                if wants_json else self._html(429, render_login_html(next_url, f"登录失败次数过多，请约 {mins} 分钟后再试"))
+            return
+        if not check_user_password(username, password):
+            login_record_failure(ip, username)
+            fail("账号或密码错误")
+            return
+        login_record_success(ip, username)
+
+        cookies = [
+            self._auth_cookie_header(username),
+            f"{LOGOUT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+        ]
+        if next_url and _is_safe_next(next_url):
+            name, create = _parse_term_next(next_url)
+            if name:
+                # 登录一步到位：签票据直接进终端（票据绑定该用户命名空间）
+                internal = internal_name(username, name)
+                if create:
+                    live = {s["name"] for s in list_sessions()}
+                    if internal not in live:
+                        cp = run_ctl("create", internal)
+                        if cp.returncode != 0:
+                            fail((cp.stderr or cp.stdout or "create failed").strip())
+                            return
+                        drop_history_after_open(internal, "")
+                try:
+                    ticket = session_ticket.issue(internal, create=False, env=ENV)
+                except ValueError as e:
+                    fail(str(e))
+                    return
+                base = _strip_ticket_from_next(next_url)
+                sep = "&" if "?" in base else "?"
+                self._redirect(f"{base}{sep}arg={quote(ticket, safe='')}", cookies)
+                return
+            self._redirect(next_url, cookies)
+            return
+        self._redirect("/", cookies)
+
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        # 登录：未认证即可调用，是获取登录态的唯一入口
+        if path == "/api/login":
+            self._handle_login()
+            return
         # 文件上传：请求体是原始字节流，必须在此分流，不能走下面的 JSON 解析
         if path == "/api/upload":
             self._handle_upload()
@@ -3059,10 +4244,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._handle_batch()
             return
-        if path in ("/api/paste-image", "/api/traffic"):
-            if not self._check_auth_or_unlock():
-                return
-        elif not self._check_auth():
+        if not self._check_auth():
             return
         length = int(self.headers.get("Content-Length", "0") or 0)
         raw = self.rfile.read(length) if length else b"{}"
@@ -3071,54 +4253,114 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             data = {}
 
+        if path == "/api/users":
+            if not is_primary(self.wt_user):
+                self._json(403, {"error": "仅管理员可管理用户"})
+                return
+            try:
+                add_user(str(data.get("username") or ""), str(data.get("password") or ""))
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            except OSError as e:
+                self._json(500, {"error": f"写入失败: {e}"})
+                return
+            self._json(200, {"ok": True, "users": list_users_info()})
+            return
+
         if path == "/api/upload-delete":
             p = str(data.get("path") or "").strip()
             if not p:
                 self._json(400, {"error": "缺少 path"})
                 return
             try:
-                result = remove_upload_file(p)
+                result = remove_upload_file(p, self.wt_user)
             except ValueError as e:
                 self._json(400, {"error": str(e)})
                 return
             except OSError as e:
                 self._json(500, {"error": str(e)})
                 return
-            self._json(200, {"history": prune_upload_history(), **result})
+            self._json(200, {"history": prune_upload_history(self.wt_user), **result})
+            return
+
+        if path == "/api/term/exec":
+            cmd = str(data.get("cmd") or "")
+            if not cmd.strip():
+                self._json(400, {"error": "缺少 cmd"})
+                return
+            if len(cmd) > 200_000:
+                self._json(400, {"error": "cmd 过长"})
+                return
+            try:
+                timeout = min(max(float(data.get("timeout", 60)), 1.0), EXEC_MAX_TIMEOUT)
+            except (TypeError, ValueError):
+                timeout = 60.0
+            internal, sid = _term_target(self.wt_user, str(data.get("name") or ""), create=data.get("create", True) is not False)
+            if internal is None:
+                self._json(404 if "不存在" in sid else (403 if "无权" in sid else 400), {"error": sid})
+                return
+            code, body = term_exec(sid, cmd, timeout)
+            self._json(code, body)
+            return
+        if path == "/api/term/send":
+            keys = data.get("keys") or []
+            if isinstance(keys, str):
+                keys = [keys]
+            if not isinstance(keys, list) or not all(isinstance(k, str) and SEND_KEY_RE.match(k) for k in keys):
+                self._json(400, {"error": "keys 只允许 tmux 键名，如 C-c、Enter、Up、Escape、F5"})
+                return
+            text = str(data.get("text") or "")
+            if not text and not keys and not data.get("enter"):
+                self._json(400, {"error": "需要 text 或 keys"})
+                return
+            internal, sid = _term_target(self.wt_user, str(data.get("name") or ""), create=bool(data.get("create")))
+            if internal is None:
+                self._json(404 if "不存在" in sid else (403 if "无权" in sid else 400), {"error": sid})
+                return
+            try:
+                term_send(sid, text, keys, bool(data.get("enter")))
+            except RuntimeError as e:
+                self._json(500, {"error": str(e)})
+                return
+            try:
+                wait = min(max(float(data.get("wait", 0.8)), 0.0), 10.0)
+            except (TypeError, ValueError):
+                wait = 0.8
+            time.sleep(wait)
+            self._json(200, {"ok": True, "foreground": _pane_cmd(sid), "screen": _trim_out(_capture(sid))})
             return
 
         if path == "/api/ticket":
-            pin = str(data.get("pin") or "")
+            user = self.wt_user
             name = str(data.get("name") or "").strip()
             create = bool(data.get("create"))
             cwd = str(data.get("cwd") or "").strip()
             if not NAME_RE.match(name):
                 self._json(400, {"error": "无效会话名"})
                 return
-            ok, extra = self._authorize_pin_or_unlock(pin)
-            if not ok:
-                self._json(403, {"error": "需要验证", "need_pin": True})
-                return
+            # 用户视角是显示名；实际会话/票据一律用内部名（其他用户带 <user>__ 前缀）
+            internal = internal_name(user, name)
             if create:
-                args = ["create", name]
+                args = ["create", internal]
                 if cwd:
                     args.append(cwd)
                 cp = run_ctl(*args)
                 if cp.returncode != 0:
                     self._json(400, {"error": (cp.stderr or cp.stdout or "create failed").strip()})
                     return
-                drop_history_after_open(name, cwd)
+                drop_history_after_open(internal, cwd)
             else:
                 live = {s["name"] for s in list_sessions()}
-                if name not in live:
+                if internal not in live:
                     self._json(404, {"error": "会话不存在或已停止"})
                     return
             try:
-                ticket = session_ticket.issue(name, create=False, env=ENV)
+                ticket = session_ticket.issue(internal, create=False, env=ENV)
             except ValueError as e:
                 self._json(500, {"error": str(e)})
                 return
-            self._json(200, {"ok": True, "ticket": ticket, "url": term_url(name, ticket)}, extra)
+            self._json(200, {"ok": True, "ticket": ticket, "url": term_url(internal, ticket)})
             return
 
         if path == "/api/rename":
@@ -3127,8 +4369,15 @@ class Handler(BaseHTTPRequestHandler):
             if not NAME_RE.match(old_name) or not NAME_RE.match(new_name):
                 self._json(400, {"error": "无效会话名"})
                 return
+            user = self.wt_user
+            old_internal = internal_name(user, old_name)
+            new_internal = internal_name(user, new_name)
+            # 兜底：旧名必须属于自己（防止改别人的会话名）
+            if not owns_session(user, old_internal):
+                self._json(404, {"error": "会话不存在或已停止"})
+                return
             try:
-                result = rename_session(old_name, new_name)
+                result = rename_session(old_internal, new_internal)
             except RuntimeError as e:
                 self._json(400, {"error": str(e)})
                 return
@@ -3166,11 +4415,12 @@ class Handler(BaseHTTPRequestHandler):
             if pages < 0 or pages > MAX_PAGES:
                 self._json(400, {"error": f"页数需在 0~{MAX_PAGES} 之间(0=用全局默认)"})
                 return
+            internal = internal_name(self.wt_user, name)
             try:
                 if live:
-                    set_session_pages(name, pages)
+                    set_session_pages(internal, pages)
                 else:
-                    set_history_pages(name, cwd, pages)
+                    set_history_pages(internal, cwd, pages)
             except RuntimeError as e:
                 self._json(400, {"error": str(e)})
                 return
@@ -3186,6 +4436,12 @@ class Handler(BaseHTTPRequestHandler):
             if not NAME_RE.match(name):
                 self._json(400, {"error": "无效会话名"}, cors)
                 return
+            # 上报名映射到该用户命名空间后的内部名入账：显示名自动加前缀、
+            # 已带自己前缀的原样保留；跨用户的名字永远落不到别人头上
+            internal = internal_name(self.wt_user, name)
+            if not owns_session(self.wt_user, internal):
+                self._json(400, {"error": "无效会话名"}, cors)
+                return
             try:
                 rx = int(data.get("rx") or 0)
                 tx = int(data.get("tx") or 0)
@@ -3197,7 +4453,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "流量增量超出合理范围"}, cors)
                 return
             try:
-                summary = add_traffic(name, rx, tx)
+                summary = add_traffic(internal, rx, tx)
             except ValueError as e:
                 self._json(400, {"error": str(e)}, cors)
                 return
@@ -3256,6 +4512,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path
+        if path.startswith("/api/users/"):
+            if not is_primary(self.wt_user):
+                self._json(403, {"error": "仅管理员可管理用户"})
+                return
+            target = unquote(path[len("/api/users/"):].strip("/"))
+            if target == self.wt_user:
+                self._json(400, {"error": "不能删除当前登录的账号"})
+                return
+            try:
+                result = delete_user(target)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            except OSError as e:
+                self._json(500, {"error": f"写入失败: {e}"})
+                return
+            self._json(200, {"ok": True, **result, "users": list_users_info()})
+            return
         if path == "/api/history" or path.startswith("/api/history"):
             qs = parse_qs(parsed.query)
             name = (qs.get("name") or [""])[0].strip()
@@ -3263,8 +4537,9 @@ class Handler(BaseHTTPRequestHandler):
             if not name:
                 self._json(400, {"error": "name required"})
                 return
+            internal = internal_name(self.wt_user, name)
             try:
-                n = delete_history(name, cwd)
+                n = delete_history(internal, cwd)
             except RuntimeError as e:
                 self._json(500, {"error": str(e)})
                 return
@@ -3275,9 +4550,15 @@ class Handler(BaseHTTPRequestHandler):
             if not name:
                 self._json(400, {"error": "name required"})
                 return
+            # 只能杀自己的会话（前端只展示自己的，这里兜底防直调）
+            internal = internal_name(self.wt_user, name)
+            live = {s["name"] for s in list_sessions()}
+            if internal not in live or not owns_session(self.wt_user, internal):
+                self._json(404, {"error": "会话不存在或已停止"})
+                return
             qs = parse_qs(parsed.query)
             purge = (qs.get("purge") or [""])[0] in ("1", "true", "yes")
-            args = ["kill", name]
+            args = ["kill", internal]
             if purge:
                 args.append("--purge")
             cp = run_ctl(*args)
@@ -3289,11 +4570,113 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
 
-def main() -> None:
+_users_lock = threading.Lock()
+USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,31}")
+
+
+def _write_users(users: dict[str, dict]) -> None:
+    """原子写 users.json（600），并让 mtime 缓存立即失效。调用方须持有 _users_lock。"""
+    f = session_ticket.USERS_FILE
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_name(f.name + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(users, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, f)
+    session_ticket._users_cache = (0.0, {})
+
+
+def _user_session_names(user: str) -> list[str]:
+    prefix = f"{user}{NAME_SEP}"
+    return [s["name"] for s in list_sessions() if str(s["name"]).startswith(prefix)]
+
+
+def list_users_info() -> list[dict]:
+    users = all_users()
+    live = [str(s["name"]) for s in list_sessions()]
+    out = []
+    for name in users:
+        prim = is_primary(name)
+        if prim:
+            cnt = sum(1 for n in live if owns_session(name, n))
+        else:
+            cnt = sum(1 for n in live if n.startswith(f"{name}{NAME_SEP}"))
+        out.append({"username": name, "primary": prim, "sessions": cnt})
+    return out
+
+
+def add_user(username: str, password: str) -> None:
+    """新增用户；校验失败抛 ValueError（消息可直接展示）。"""
+    username = (username or "").strip()
+    if not USERNAME_RE.fullmatch(username):
+        raise ValueError("用户名只能含字母、数字、短横线，以字母或数字开头，最长 32 位")
+    if len(password) < 6 or len(password) > 128 or any(ord(c) < 32 for c in password):
+        raise ValueError("密码长度需在 6~128 位之间，且不能含控制字符")
+    with _users_lock:
+        users = {k: dict(v) for k, v in all_users().items()}
+        if any(k.lower() == username.lower() for k in users) or username.lower() == USER.lower():
+            raise ValueError("用户名已存在")
+        # 主用户已有以 <username>__ 开头的会话名时，新用户会“继承”它们，拒绝
+        prefix = f"{username}{NAME_SEP}"
+        if any(str(s["name"]).startswith(prefix) for s in list_sessions()):
+            raise ValueError("该用户名与现有会话名前缀冲突，请换一个")
+        users[username] = {"password": password}
+        _write_users(users)
+
+
+def delete_user(username: str) -> dict:
+    """删除用户：移除账号（登录 Cookie、终端票据随之失效），停掉并清理其会话与历史。
+    保留其上传的文件（~/Downloads/<user>/），避免误删数据。"""
+    with _users_lock:
+        users = {k: dict(v) for k, v in all_users().items()}
+        if username not in users:
+            raise ValueError("用户不存在")
+        if is_primary(username):
+            raise ValueError("不能删除主管理员")
+        del users[username]
+        _write_users(users)
+    killed = 0
+    prefix = f"{username}{NAME_SEP}"
+    for name in _user_session_names(username):
+        if run_ctl("kill", name, "--purge").returncode == 0:
+            killed += 1
+    hist = 0
     try:
-        session_ticket.get_pin(ENV)
-    except ValueError as e:
-        raise SystemExit(f".env 配置错误: {e}") from e
+        for it in list_history(exclude_live=False):
+            n = str(it.get("name") or "")
+            if n.startswith(prefix):
+                hist += delete_history(n, str(it.get("cwd") or ""))
+    except RuntimeError:
+        pass
+    try:
+        upload_hist_file_for(username).unlink()
+    except OSError:
+        pass
+    return {"killed_sessions": killed, "deleted_history": hist}
+
+
+def ensure_users_file() -> None:
+    """首次启用多用户：users.json 不存在时用 .env 主账号生成。
+    之后管理员可直接编辑该文件增删用户（服务端 mtime 缓存自动生效）。"""
+    if session_ticket.USERS_FILE.exists():
+        return
+    users = {USER: {"password": PASSWORD}}
+    session_ticket.USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    session_ticket.USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        session_ticket.USERS_FILE.chmod(0o600)
+    except OSError:
+        pass
+    print(f"[users] 初始化 {session_ticket.USERS_FILE}（主用户 {USER}）", flush=True)
+
+
+def main() -> None:
+    if not PASSWORD:
+        raise SystemExit(".env 配置错误: TTYD_PASSWORD 未设置")
+    ensure_users_file()
+    users = all_users()
+    if users:
+        print(f"[users] {len(users)} 个用户: {', '.join(users.keys())}（首位为主用户）", flush=True)
     httpd = ThreadingHTTPServer((MANAGE_HOST, MANAGE_PORT), Handler)
     start_lan_watcher()  # 后台每 20s 刷新局域网地址，避免页面显示过期 IP
     print(f"manage listening on http://{MANAGE_HOST}:{MANAGE_PORT}", flush=True)

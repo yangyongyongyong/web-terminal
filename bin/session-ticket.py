@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""会话进入票据：用 SESSION_PIN 签发/校验，防止仅 Basic Auth 直连 /term。"""
+"""会话进入票据：按用户签发/校验，防止没登录直接用终端 URL 越权进入。
+
+门槛只有一道：管理服务只会给"已登录用户"签发票据，attach-session.sh 校验票据签名。
+多用户：config/users.json（首个为主用户）。会话内部名带 "<user>__" 前缀的用该用户
+的密码派生密钥；无前缀（主用户/历史遗留）用主用户密钥。
+"""
 from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PIN_RE = re.compile(r"^.{1,128}$")
+USERS_FILE = ROOT / "config" / "users.json"
 # 终端 URL 票据：覆盖断线重连
 TTL_SEC = 12 * 3600
-# PIN 解锁 Cookie：输入一次后 24h 内免再输
-UNLOCK_TTL_SEC = 24 * 3600
-UNLOCK_COOKIE = "wt_pin_ok"
+NAME_SEP = "__"
 
 
 def load_env() -> dict[str, str]:
@@ -32,16 +36,67 @@ def load_env() -> dict[str, str]:
     return env
 
 
-def get_pin(env: dict[str, str] | None = None) -> str:
+def _key(user: str, password: str) -> bytes:
+    return hashlib.sha256(f"wt-ticket-v2:{user}:{password}".encode("utf-8")).digest()
+
+
+# ---- 多用户：config/users.json（无该文件=单用户，回落 .env 的 TTYD_USER/TTYD_PASSWORD）----
+_users_cache: tuple[float, dict[str, dict]] = (0.0, {})
+
+
+def load_users() -> dict[str, dict]:
+    """读 users.json（mtime 缓存）。返回 {用户名: {"password":…}}；
+    文件不存在/损坏时返回 {}，此时一律按主用户（.env）处理。
+    用户名限 [A-Za-z0-9-]（会话名前缀 <user>__ 的解析前提）。"""
+    global _users_cache
+    try:
+        mtime = USERS_FILE.stat().st_mtime
+    except OSError:
+        return {}
+    if _users_cache[0] == mtime:
+        return _users_cache[1]
+    try:
+        raw = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+        users = {
+            str(k): {"password": str(v.get("password", ""))}
+            for k, v in raw.items()
+            if isinstance(v, dict) and v.get("password")
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,31}", str(k))
+        }
+    except (OSError, json.JSONDecodeError, AttributeError):
+        users = {}
+    _users_cache = (mtime, users)
+    return users
+
+
+def primary_creds(env: dict[str, str]) -> tuple[str, str]:
+    """主用户 (用户名, 密码)：users.json 首个，回落 .env。"""
+    users = load_users()
+    if users:
+        name, u = next(iter(users.items()))
+        return name, u["password"]
+    return env.get("TTYD_USER", "admin"), env.get("TTYD_PASSWORD", "")
+
+
+def user_secret(user: str, env: dict[str, str] | None = None) -> bytes:
+    """指定用户的签名密钥；未知用户回落主用户。"""
     env = env or load_env()
-    pin = (env.get("SESSION_PIN") or "").strip()
-    if not PIN_RE.match(pin):
-        raise ValueError("SESSION_PIN 未配置或过长")
-    return pin
+    u = load_users().get(user)
+    if u:
+        return _key(user, u["password"])
+    pname, ppw = primary_creds(env)
+    return _key(pname, ppw)
 
 
-def _key(pin: str, password: str) -> bytes:
-    return hashlib.sha256(f"wt-ticket:{pin}:{password}".encode("utf-8")).digest()
+def owner_of_session(name: str, env: dict[str, str] | None = None) -> str:
+    """内部会话名 → 归属用户名。<user>__<原名> 归 user（非主用户），其余归主用户。"""
+    env = env or load_env()
+    pname, _ = primary_creds(env)
+    if NAME_SEP in name:
+        head = name.split(NAME_SEP, 1)[0]
+        if head in load_users() and head != pname:
+            return head
+    return pname
 
 
 def sanitize_name(name: str) -> str:
@@ -57,23 +112,17 @@ def is_valid_name(name: str) -> bool:
 
 def issue(name: str, create: bool = False, env: dict[str, str] | None = None) -> str:
     env = env or load_env()
-    pin = get_pin(env)
-    password = env.get("TTYD_PASSWORD", "")
     name = sanitize_name(name)
+    key = user_secret(owner_of_session(name, env), env)
     exp = int(time.time()) + TTL_SEC
     flag = "c" if create else "a"
     msg = f"{exp}:{name}:{flag}".encode("utf-8")
-    sig = hmac.new(_key(pin, password), msg, hashlib.sha256).hexdigest()[:32]
+    sig = hmac.new(key, msg, hashlib.sha256).hexdigest()[:32]
     return f"t1.{exp}.{name}.{flag}.{sig}"
 
 
 def verify(name: str, ticket: str, need_create: bool = False, env: dict[str, str] | None = None) -> bool:
     env = env or load_env()
-    try:
-        pin = get_pin(env)
-    except ValueError:
-        return False
-    password = env.get("TTYD_PASSWORD", "")
     name = sanitize_name(name)
     parts = (ticket or "").split(".")
     if len(parts) != 5 or parts[0] != "t1":
@@ -91,59 +140,16 @@ def verify(name: str, ticket: str, need_create: bool = False, env: dict[str, str
         return False
     if exp < int(time.time()):
         return False
+    key = user_secret(owner_of_session(name, env), env)
     msg = f"{exp}:{name}:{flag}".encode("utf-8")
-    expect = hmac.new(_key(pin, password), msg, hashlib.sha256).hexdigest()[:32]
-    return hmac.compare_digest(expect, sig)
-
-
-def check_pin(pin: str, env: dict[str, str] | None = None) -> bool:
-    env = env or load_env()
-    try:
-        expect = get_pin(env)
-    except ValueError:
-        return False
-    if not pin or len(pin) > 128:
-        return False
-    return hmac.compare_digest(pin, expect)
-
-
-def issue_unlock(env: dict[str, str] | None = None) -> tuple[str, int]:
-    """返回 (token, max_age_seconds)。"""
-    env = env or load_env()
-    pin = get_pin(env)
-    password = env.get("TTYD_PASSWORD", "")
-    exp = int(time.time()) + UNLOCK_TTL_SEC
-    msg = f"unlock:{exp}".encode("utf-8")
-    sig = hmac.new(_key(pin, password), msg, hashlib.sha256).hexdigest()[:32]
-    return f"u1.{exp}.{sig}", UNLOCK_TTL_SEC
-
-
-def verify_unlock(token: str, env: dict[str, str] | None = None) -> bool:
-    env = env or load_env()
-    try:
-        pin = get_pin(env)
-    except ValueError:
-        return False
-    password = env.get("TTYD_PASSWORD", "")
-    parts = (token or "").split(".")
-    if len(parts) != 3 or parts[0] != "u1":
-        return False
-    _, exp_s, sig = parts
-    try:
-        exp = int(exp_s)
-    except ValueError:
-        return False
-    if exp < int(time.time()):
-        return False
-    msg = f"unlock:{exp}".encode("utf-8")
-    expect = hmac.new(_key(pin, password), msg, hashlib.sha256).hexdigest()[:32]
+    expect = hmac.new(key, msg, hashlib.sha256).hexdigest()[:32]
     return hmac.compare_digest(expect, sig)
 
 
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(
-            "usage: session-ticket.py issue <name> [create]|verify <name> <ticket> [create]|check-pin <pin>|sanitize <name>",
+            "usage: session-ticket.py issue <name> [create]|verify <name> <ticket> [create]|sanitize <name>",
             file=sys.stderr,
         )
         return 2
@@ -162,10 +168,6 @@ def main(argv: list[str]) -> int:
             ticket = argv[3]
             need_create = len(argv) > 4 and argv[4] == "create"
             ok = verify(name, ticket, need_create=need_create)
-            print("ok" if ok else "fail")
-            return 0 if ok else 1
-        if cmd == "check-pin":
-            ok = check_pin(argv[2] if len(argv) > 2 else "")
             print("ok" if ok else "fail")
             return 0 if ok else 1
     except Exception as e:

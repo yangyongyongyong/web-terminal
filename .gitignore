@@ -4,6 +4,10 @@
 !.env.example
 LOCAL.md
 
+# 用户账号库（含明文密码）、会话目录
+config/users.json
+sessions/
+
 # Cloudflare Tunnel 真实配置（域名/ID 私有；模板见 cloudflared.yml.example）
 config/cloudflared.yml
 
@@ -13,6 +17,7 @@ config/*.web-terminal.*.plist
 
 logs/
 run/
+web/term/
 web/ttyd-stock.html
 web/ttyd-index.html
 __pycache__/

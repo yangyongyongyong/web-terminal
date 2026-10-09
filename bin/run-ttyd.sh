@@ -27,11 +27,12 @@ BASE_PATH="${TTYD_BASE_PATH:-/term}"
 SCROLLBACK_LINES=$(( ${SCROLLBACK_PAGES:-30} * 50 ))
 if [[ "${SCROLLBACK_LINES}" -lt 200 ]]; then SCROLLBACK_LINES=200; fi
 
-# 端口：对内仍 7681；对外经 Cloudflare path /term
+# 端口：对外 7681 由 Caddy 反代（压缩 HTML，跨境省 74% 流量）；本体只听内部
 TTYD_ARGS=(
   --interface "${TTYD_HOST}"
-  --port "${TTYD_PORT}"
-  --credential "${TTYD_USER}:${TTYD_PASSWORD}"
+  --port "${TTYD_LISTEN_PORT:-17781}"
+  # 不再使用 --credential（Basic 弹窗）：页面本身无敏感内容，shell 由
+  # attach-session.sh 的登录票据把关；登录改走管理端口 7690 的登录页。
   --writable
   --url-arg
   --base-path "${BASE_PATH}"

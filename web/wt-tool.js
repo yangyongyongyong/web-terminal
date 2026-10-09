@@ -17,6 +17,7 @@
   "use strict";
 
   var POLL_MS = 2500;
+  var IDLE_STEPS = [2500, 5000, 10000, 20000, 30000];
   var BACKOFF_MS = 15000;
   var MAX_FAILS = 3;
 
@@ -97,8 +98,21 @@
     if (!el || !name) return null;
     var pollMs = opts.pollMs || POLL_MS;
     var fails = 0;
+    var idleIdx = 0;      // 空闲退避档位：结果无变化时逐档放慢，省公网流量
+    var lastBadge = null;
     var timer = null;
     var stopped = false;
+
+    // 用户一敲键就说明在干活，立即回到最快档
+    function markActive() {
+      idleIdx = 0;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+        schedule(500);
+      }
+    }
+    document.addEventListener("keydown", markActive, { capture: true, passive: true });
 
     async function tick() {
       if (stopped) return;
@@ -109,8 +123,14 @@
       try {
         var info = await fetchTool(name);
         fails = 0;
-        renderTool(el, info);
-        schedule(pollMs);
+        var text = renderTool(el, info);
+        if (text !== lastBadge) {
+          lastBadge = text;
+          idleIdx = 0;    // 前台工具变了：保持快轮询跟上
+        } else if (idleIdx < IDLE_STEPS.length - 1) {
+          idleIdx += 1;   // 没变化：放慢
+        }
+        schedule(IDLE_STEPS[idleIdx]);
       } catch (e) {
         fails += 1;
         if (fails >= MAX_FAILS) renderTool(el, null); // 别一直显示过期状态

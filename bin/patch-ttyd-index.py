@@ -192,11 +192,13 @@ try {
 } catch (e) {}
 </script>
 <script id="wt-traffic-meter">
-(function () {
-  // 统计本会话经 WebSocket 实际收发的字节（即真正过网的量），
-  // 每 5s 把增量上报给管理服务按「日期+会话」累加，页面刷新后累计值不丢。
-  var params = new URLSearchParams(location.search);
-  var name = params.getAll('arg')[0] || 'main';
+ (function () {
+   // 统计本会话经 WebSocket 实际收发的字节（即真正过网的量），
+   // 每 5s 把增量上报给管理服务按「日期+会话」累加，页面刷新后累计值不丢。
+   // 多用户：URL arg 即内部会话名（主用户原名 / 其他用户 <user>__原名），
+   // 服务端按上报者身份做归属校验（internal_name 幂等），直接上报内部名。
+   var params = new URLSearchParams(location.search);
+   var name = params.getAll('arg')[0] || 'main';
   var pendRx = 0, pendTx = 0;   // 未上报的增量
   var baseTotal = 0;            // 服务端已记录的本会话累计
   var liveTotal = 0;            // 本页新产生的量
@@ -272,6 +274,21 @@ try {
 </script>
 <script id="wt-reconnect">
 (function () {
+  // 无登录票据的访问：不去连 ttyd（会被 attach-session 拒），直接送去
+  // 管理端口 /enter 登录（账号密码可存浏览器，登录后自动换票据跳回本页）
+  try {
+    var p0 = new URLSearchParams(location.search);
+    var hasTicket = p0.getAll('arg').some(function (a) { return a.indexOf('t1.') === 0; });
+    if (!hasTicket) {
+      var base = window.WT_API_BASE;
+      if (!base) {
+        var tunnelPort = location.port === '' || location.port === '443' || location.port === '80';
+        base = tunnelPort ? '' : (location.protocol + '//' + location.hostname + ':' + '__MANAGE_PORT__');
+      }
+      location.replace(base + '/enter?next=' + encodeURIComponent(location.href));
+      return;
+    }
+  } catch (e) {}
   document.body.classList.add('wt-has-bar');
   var statusEl = document.getElementById('wt-status');
   var sessionEl = document.getElementById('wt-session');
@@ -321,6 +338,38 @@ try {
     }, wait);
   }
 
+  function onWsOpen() {
+    openedOnce = true;
+    delay = 1000;
+    if (timer) { clearTimeout(timer); timer = null; }
+    setStatus('已连接', '');
+    function pin() {
+      if (window.term && window.WtWheel && window.WtWheel.pinBottomDuringAttach) {
+        window.WtWheel.pinBottomDuringAttach(window.term, 2000);
+        return true;
+      }
+      return false;
+    }
+    if (!pin()) {
+      var tries = 0;
+      var waitTerm = setInterval(function () {
+        tries += 1;
+        if (pin() || tries > 40) clearInterval(waitTerm);
+      }, 50);
+    }
+  }
+
+  function onWsClose() {
+    if (leaving) return;
+    scheduleReload('连接断开');
+  }
+
+  // body 开头的 wt-ws-wrap 已在 ttyd 建连前装好钩子：这里只挂回调；
+  // 若 WS 已经打开（我们执行前就连上了），立即补一次 open 处理
+  if (window.WT_WS && typeof window.WT_WS.register === 'function') {
+    window.WT_WS.register(onWsOpen, onWsClose);
+  }
+
   window.addEventListener('online', function () {
     if (!leaving && openedOnce) {
       delay = 1000;
@@ -337,69 +386,6 @@ try {
       location.reload();
     }
   });
-
-  var NativeWS = window.WebSocket;
-  function WrappedWS(url, protocols) {
-    var ws = (protocols === undefined) ? new NativeWS(url) : new NativeWS(url, protocols);
-    // 计流量：统计真正过网的字节。收到的是 ArrayBuffer/Blob/字符串三种可能。
-    ws.addEventListener('message', function (ev) {
-      if (!window.WtTraffic) return;
-      var d = ev.data, n = 0;
-      try {
-        if (d == null) n = 0;
-        else if (typeof d === 'string') n = d.length;           // ttyd 文本帧按字符近似
-        else if (typeof d.byteLength === 'number') n = d.byteLength;
-        else if (typeof d.size === 'number') n = d.size;
-      } catch (e) {}
-      window.WtTraffic.addRx(n);
-    });
-    var origSend = ws.send;
-    ws.send = function (payload) {
-      if (window.WtTraffic) {
-        var n = 0;
-        try {
-          if (payload == null) n = 0;
-          else if (typeof payload === 'string') n = payload.length;
-          else if (typeof payload.byteLength === 'number') n = payload.byteLength;
-          else if (typeof payload.size === 'number') n = payload.size;
-        } catch (e) {}
-        window.WtTraffic.addTx(n);
-      }
-      return origSend.call(ws, payload);
-    };
-    ws.addEventListener('open', function () {
-      openedOnce = true;
-      delay = 1000;
-      if (timer) { clearTimeout(timer); timer = null; }
-      setStatus('已连接', '');
-      function pin() {
-        if (window.term && window.WtWheel && window.WtWheel.pinBottomDuringAttach) {
-          window.WtWheel.pinBottomDuringAttach(window.term, 2000);
-          return true;
-        }
-        return false;
-      }
-      if (!pin()) {
-        var tries = 0;
-        var waitTerm = setInterval(function () {
-          tries += 1;
-          if (pin() || tries > 40) clearInterval(waitTerm);
-        }, 50);
-      }
-    });
-    ws.addEventListener('close', function () {
-      if (leaving) return;
-      scheduleReload('连接断开');
-    });
-    ws.addEventListener('error', function () {});
-    return ws;
-  }
-  WrappedWS.prototype = NativeWS.prototype;
-  WrappedWS.CONNECTING = NativeWS.CONNECTING;
-  WrappedWS.OPEN = NativeWS.OPEN;
-  WrappedWS.CLOSING = NativeWS.CLOSING;
-  WrappedWS.CLOSED = NativeWS.CLOSED;
-  window.WebSocket = WrappedWS;
 
   // 顶栏显示当前前台交互式工具（Claude / Codex / Python …）
   try {
@@ -523,8 +509,154 @@ def main() -> int:
         if "wt-favicon" not in patched:
             patched = patched.replace("</title>", "</title>" + favicon_links(), 1)
     patched = patched.replace("</body>", build_inject() + "</body>", 1)
+    # WS 包装必须装在 <body> 第一行：先于 ttyd 主脚本执行。ttyd 的 WS 建在
+    # componentDidMount 的 await refreshToken() 微任务里，若注入太晚（旧方案在
+    # </body> 前），open 监听挂不上 → 状态永远“连接中…”。
+    patched = patched.replace(
+        "<body>",
+        "<body>"
+        '<script id="wt-ws-wrap">'
+        "(function () {"
+        "  var NativeWS = window.WebSocket;"
+        "  var cbOpen = [], cbClose = [], lastWs = null;"
+        "  function WrappedWS(url, protocols) {"
+        "    var ws = (protocols === undefined) ? new NativeWS(url) : new NativeWS(url, protocols);"
+        "    lastWs = ws;"
+        "    ws.addEventListener('message', function (ev) {"
+        "      if (!window.WtTraffic) return;"
+        "      var d = ev.data, n = 0;"
+        "      try {"
+        "        if (d == null) n = 0;"
+        "        else if (typeof d === 'string') n = d.length;"
+        "        else if (typeof d.byteLength === 'number') n = d.byteLength;"
+        "        else if (typeof d.size === 'number') n = d.size;"
+        "      } catch (e) {}"
+        "      window.WtTraffic.addRx(n);"
+        "    });"
+        "    var origSend = ws.send.bind(ws);"
+        "    ws.send = function (payload) {"
+        "      if (window.WtTraffic) {"
+        "        var n = 0;"
+        "        try {"
+        "          if (payload == null) n = 0;"
+        "          else if (typeof payload === 'string') n = payload.length;"
+        "          else if (typeof payload.byteLength === 'number') n = payload.byteLength;"
+        "          else if (typeof payload.size === 'number') n = payload.size;"
+        "        } catch (e) {}"
+        "        window.WtTraffic.addTx(n);"
+        "      }"
+        "      return origSend(payload);"
+        "    };"
+        "    ws.addEventListener('open', function (ev) {"
+        "      cbOpen.forEach(function (f) { try { f(ev, ws); } catch (e) {} });"
+        "    });"
+        "    ws.addEventListener('close', function (ev) {"
+        "      cbClose.forEach(function (f) { try { f(ev, ws); } catch (e) {} });"
+        "    });"
+        "    return ws;"
+        "  }"
+        "  WrappedWS.prototype = NativeWS.prototype;"
+        "  WrappedWS.CONNECTING = NativeWS.CONNECTING;"
+        "  WrappedWS.OPEN = NativeWS.OPEN;"
+        "  WrappedWS.CLOSING = NativeWS.CLOSING;"
+        "  WrappedWS.CLOSED = NativeWS.CLOSED;"
+        "  window.WebSocket = WrappedWS;"
+        "  window.WT_WS = {"
+        "    register: function (onOpen, onClose) {"
+        "      if (onOpen) {"
+        "        cbOpen.push(onOpen);"
+        "        if (lastWs && lastWs.readyState === 1) { try { onOpen(null, lastWs); } catch (e) {} }"
+        "      }"
+        "      if (onClose) cbClose.push(onClose);"
+        "    }"
+        "  };"
+        "})();"
+        "</script>",
+        1,
+    )
     OUT.write_text(patched, encoding="utf-8")
     print(f"已写入 {OUT} ({OUT.stat().st_size} bytes)")
+    return build_split(patched)
+
+
+def build_split(full_html: str) -> int:
+    """把 694KB 主 bundle 拆成内容哈希命名的静态资产（浏览器可永久缓存），
+    index 只留壳；资产拉取失败时回退到全量单文件版（也走静态缓存）。
+
+    产出（web/term/assets/，由 Caddy file_server + precompressed 直出）：
+      - term-bundle-<hash>.js / .gz / .zst     主前端包（immutable 长缓存）
+      - index-full-<hash>.html / .gz / .zst    全量兜底页
+    """
+    import gzip as _gzip
+    import hashlib
+    import shutil
+    import subprocess
+
+    assets_dir = ROOT / "web" / "term" / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) 抽出主 <script>（stock 里只有一个 694KB 的大 script）
+    marker = '<script type="text/javascript">'
+    i = full_html.find(marker)
+    if i < 0:
+        print("未找到主 script，跳过拆分（保留内联全量版）", file=sys.stderr)
+        return 0
+    j = full_html.find("</script>", i)
+    bundle = full_html[i + len(marker):j]
+
+    # 2) 写资产（内容哈希命名，配置变化 → hash 变化 → 缓存自动失效）
+    h = hashlib.sha1(bundle.encode("utf-8")).hexdigest()[:10]
+    js_path = assets_dir / f"term-bundle-{h}.js"
+    js_path.write_text(bundle, encoding="utf-8")
+
+    # 3) 壳：外链 + onerror 回退到全量静态页（带上当前 query，票据/参数不丢）
+    shell = full_html[:i] + (
+        '<script>function __wtBundleFail(){'
+        "try{location.replace('/term/assets/index-full-__HASH__.html'+location.search)}"
+        "catch(e){location.reload()}"
+        '}</script>'
+        f'<script src="/term/assets/term-bundle-{h}.js" onerror="__wtBundleFail()"></script>'
+    ) + full_html[j:]
+    shell = shell.replace("__HASH__", h)
+
+    # 4) 全量兜底页：内联版原样存静态（含全部注入层与回退逻辑）
+    full_path = assets_dir / f"index-full-{h}.html"
+    full_path.write_text(full_html, encoding="utf-8")
+
+    # 5) 预压缩（file_server precompressed 直出 .gz/.zst，零运行时 CPU）
+    def precompress(p: Path):
+        with open(p, "rb") as f:
+            data = f.read()
+        with open(str(p) + ".gz", "wb") as f:
+            f.write(_gzip.compress(data, 9))
+        try:
+            subprocess.run(
+                ["zstd", "-q", "-19", "-f", "-o", str(p) + ".zst", str(p)],
+                check=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"zstd 预压缩失败（忽略，走 gzip）: {e}", file=sys.stderr)
+
+    precompress(js_path)
+    precompress(full_path)
+
+    # 6) 清理旧版本资产：只保留当前 hash 前缀的文件（js/gz/zst/html），防止目录膨胀
+    keep = {f"term-bundle-{h}.js", f"index-full-{h}.html"}
+    keep |= {n + suf for n in keep for suf in (".gz", ".zst")}
+    for old in assets_dir.iterdir():
+        if old.name not in keep:
+            old.unlink(missing_ok=True)
+
+    # 7) 壳写到 OUT（ttyd --index 用它）
+    OUT.write_text(shell, encoding="utf-8")
+    kbs = lambda p: p.stat().st_size // 1024
+    print(
+        f"已拆分: 壳 {kbs(OUT)}KB + bundle term-bundle-{h}.js {kbs(js_path)}KB"
+        f"（gz {kbs(Path(str(js_path) + '.gz'))}KB / zst {kbs(Path(str(js_path) + '.zst'))}KB）"
+        f" + 兜底页 index-full-{h}.html {kbs(full_path)}KB"
+    )
+    del kbs
     return 0
 
 

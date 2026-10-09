@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ttyd --url-arg 入口：attach-session.sh <name> [create] <ticket>
-# 必须带有效 PIN 票据；断线 SIGHUP 仅 detach，会话保留
+# 必须带有效登录票据（仅管理服务对已登录用户签发）；断线 SIGHUP 仅 detach，会话保留
 set -euo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -38,14 +38,31 @@ done
 
 deny() {
   printf '\n[web-terminal] %s\n' "$1"
-  printf '请打开管理页并输入 PIN 后再进入：https://%s/\n\n' "${PUBLIC_HOST}"
+  printf '或打开登录页直接进入：http://%s:%s/enter\n\n' "${PUBLIC_HOST}" "${MANAGE_PORT:-7690}"
   printf '按 Ctrl-C 关闭此页…\n'
-  sleep 3600
+  # 无凭证连接保持占用一个进程：限制并发驻留数，防止匿名连接堆积吃内存
+  DENY_DIR="${ROOT}/run/denies"
+  mkdir -p "${DENY_DIR}" 2>/dev/null || true
+  DENY_MAX="${WT_DENY_MAX:-16}"
+  mark=""
+  if [[ -d "${DENY_DIR}" ]]; then
+    # 清掉超过 2h 的僵尸标记（进程早没了）
+    find "${DENY_DIR}" -type f -mmin +120 -delete 2>/dev/null || true
+    mark="${DENY_DIR}/$$"
+    if [[ "$(ls -1 "${DENY_DIR}" 2>/dev/null | wc -l)" -lt "${DENY_MAX}" ]]; then
+      : >"${mark}" 2>/dev/null || mark=""
+    fi
+  fi
+  if [[ -n "${mark}" ]]; then
+    trap 'rm -f "${mark}" 2>/dev/null || true' EXIT INT TERM
+    sleep 3600
+    rm -f "${mark}" 2>/dev/null || true
+  fi
   exit 1
 }
 
 if [[ -z "${raw_name}" || "${raw_name}" == t1.* ]]; then
-  deny "缺少会话名或 PIN 票据无效"
+  deny "缺少会话名或登录票据无效"
 fi
 
 name="$(/opt/homebrew/bin/python3 "${TICKET_PY}" sanitize "${raw_name}")"
@@ -55,7 +72,7 @@ fi
 session="wt-${name}"
 
 if [[ -z "${ticket}" ]]; then
-  deny "需要 PIN 票据才能进入会话（Chrome 保存的登录密码不够）"
+  deny "请先登录后再进入会话"
 fi
 
 verify_args=("${TICKET_PY}" verify "${name}" "${ticket}")
@@ -63,7 +80,7 @@ if [[ "${mode}" == "create" ]]; then
   verify_args+=("create")
 fi
 if ! /opt/homebrew/bin/python3 "${verify_args[@]}" >/dev/null; then
-  deny "PIN 票据无效或已过期"
+  deny "登录票据无效或已过期，请重新登录"
 fi
 
 touch_meta() {
