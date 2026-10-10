@@ -3610,15 +3610,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _has_valid_auth(self) -> bool:
         """登录态：wt_auth Cookie（表单登录 24h）或 Basic（curl/脚本）。
-        通过后 self.wt_user 为当前用户名（Basic 优先，其次 cookie 绑定的用户）。"""
-        if self._basic_ok():
-            return True
+        Cookie 优先：浏览器可能还缓存着别的账号的 Basic 凭据（旧弹框保存过），
+        若 Basic 优先，换账号登录后仍会被识别成旧账号。只在无有效 Cookie 时才看 Basic。"""
         cookies = parse_cookies(self.headers.get("Cookie", ""))
         user = verify_auth_token(cookies.get(AUTH_COOKIE, ""))
         if user:
             self.wt_user = user
             return True
-        return False
+        return self._basic_ok()
 
     def _auth_cookie_header(self, user: str) -> str:
         token, max_age = issue_auth_token(user)
