@@ -57,6 +57,17 @@ sudo ./bin/install-systemd-dropins.sh   # 安装 config/systemd/ 下的 drop-in�
 
 它给 manage 设 `KillMode=process` + `OOMPolicy=continue`，给 ttyd 设 `OOMPolicy=continue`。装完无需重启服务，配置在下次停止或 OOM 时生效。
 
+### 小内存机：swap 与内存限制
+
+会话进程（claude、构建任务）都跑在 manage unit 的 cgroup 里，跑爆内存时会直接影响整机。两步防护：
+
+```bash
+sudo ./bin/setup-swap.sh 4        # 扩 swap 到 4G 并把 swappiness 降到 10（幂等）
+sudo ./bin/install-systemd-dropins.sh   # 含 20-memory-limit.conf
+```
+
+`config/systemd/web-terminal-manage.service.d/20-memory-limit.conf` 给整个会话组设额度：`MemoryHigh=2G`（软限，超出只回收不杀）、`MemoryMax=2500M`（硬限，超出仅在 unit 内 OOM）、`MemorySwapMax=1500M`（防止一个会话吃光 swap）。要跑更大的构建，调高这三个值即可。
+
 ## 结构
 
 ```
