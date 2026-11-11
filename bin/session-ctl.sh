@@ -12,7 +12,6 @@ TMUX_CONF="${ROOT}/config/tmux.web.conf"
 SHELL_BIN="${LOGIN_SHELL:-/bin/zsh}"
 META_DIR="${ROOT}/run/sessions"
 HISTORY_FILE="${ROOT}/run/session-history.jsonl"
-PATH_ROOT="${SESSION_PATH_ROOT:-${HOME}}"
 DEFAULT_PATH="${SESSION_DEFAULT_PATH:-${HOME}}"
 
 mkdir -p "${META_DIR}"
@@ -37,30 +36,19 @@ meta_set() {
   printf '%s\n' "$3" >"${META_DIR}/${1}.${2}"
 }
 
-# 解析并校验工作目录：必须存在且位于 SESSION_PATH_ROOT 之下
+# 解析工作目录：必须存在且是目录，不限范围；相对路径相对默认工作目录
 resolve_cwd() {
   local raw="${1:-}"
-  local root def resolved
-  root="$(cd "${PATH_ROOT}" 2>/dev/null && pwd -P)" || {
-    echo "SESSION_PATH_ROOT 无效: ${PATH_ROOT}" >&2
-    return 1
-  }
+  local def resolved
   def="${raw:-${DEFAULT_PATH}}"
   if [[ "${def}" != /* ]]; then
-    def="${root}/${def}"
+    def="${DEFAULT_PATH%/}/${def}"
   fi
   if [[ ! -d "${def}" ]]; then
     echo "路径不存在或不是目录: ${def}" >&2
     return 1
   fi
   resolved="$(cd "${def}" && pwd -P)"
-  case "${resolved}" in
-    "${root}"|"${root}"/*) ;;
-    *)
-      echo "路径超出允许范围（须在 ${root} 下）: ${resolved}" >&2
-      return 1
-      ;;
-  esac
   printf '%s\n' "${resolved}"
 }
 

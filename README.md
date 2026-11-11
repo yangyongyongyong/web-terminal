@@ -14,8 +14,8 @@
 - **断线重连**：终端页自动退避重连；网络恢复 / 标签页重新可见时立即重试
 - **会话保留**：每个连接挂到独立 `tmux` 会话（`wt-*`），浏览器断开不会杀进程
 - **会话管理**：首页可查看当前会话、历史（已停止）、新建 / 打开 / 停止
-- **进入 PIN**：打开/新建终端需输入 `.env` 的 `SESSION_PIN`（与 Basic Auth 分离；界面不提示规则）
-- **工作目录**：新建时可指定路径，且必须在 `SESSION_PATH_ROOT` 下；管理页支持按名称/路径关键字检索
+- **登录**：管理页账号密码登录（`config/users.json`，多用户），进入终端走一次性票据，无需再输 PIN
+- **工作目录**：新建时可指定任意已存在的目录（不限范围，缺省为 `SESSION_DEFAULT_PATH`）；管理页支持按名称/路径关键字检索
 - **移动端底部不再被遮**：终端容器高度改用 `100dvh`（动态视口高度，随地址栏/手势导航条展开收起实时变化），不支持的老浏览器兜底用 `100vh`；修的是 Android 上「底部被系统白色手势条压住一部分」
 - **前台工具徽标**：顶栏在「会话: xxx」后面彩色显示当前正在用的交互式工具（Claude / Codex / Cursor Agent / Python / Scala / vim / psql …），回到 shell 提示符自动隐藏
 - **文本搜索**：`⌘F`（mac）/ `Ctrl+F`（Windows·Linux）打开搜索条，命中全部上底色、当前命中额外高亮并滚动到可见；回车下一个、`Shift+回车`上一个、`Esc` 关闭；选中文字后按 `⌘F` 直接带入关键词
@@ -33,12 +33,12 @@
 ```bash
 cd ~/web-terminal
 cp .env.example .env   # 仓库只带模板；密钥只写进本地 .env（已 gitignore）
-# 编辑 .env：TTYD_PASSWORD、SESSION_PIN、PUBLIC_HOST 等
+# 编辑 .env：TTYD_PASSWORD、PUBLIC_HOST 等
 ./bin/start.sh
 ./bin/status.sh
 ```
 
-浏览器打开你的域名，用 `.env` 里的账号密码登录管理页，进入终端时再输 `SESSION_PIN`。
+浏览器打开你的域名，用 `.env` 里的账号密码登录管理页，再进入终端。
 
 ```bash
 ./bin/stop.sh           # 停止服务（保留 tmux 会话）
@@ -46,6 +46,16 @@ cp .env.example .env   # 仓库只带模板；密钥只写进本地 .env（已 g
 ```
 
 `start.sh` 会安装 **LaunchDaemon**（`/Library/LaunchDaemons`）：开机/通电后**无需手动登录**也会启动（以本机用户运行）。若开了 FileVault，仍需完成一次磁盘解锁。
+
+### Linux / systemd
+
+服务单元里必须让 tmux 会话与 Web 服务**生命周期解耦**，否则会话里一次 OOM 或一次 `systemctl restart` 就会杀掉所有 `wt-*` 会话（tmux server 是由 manage 服务派生的，默认落在它的 cgroup 里）：
+
+```bash
+sudo ./bin/install-systemd-dropins.sh   # 安装 config/systemd/ 下的 drop-in，幂等
+```
+
+它给 manage 设 `KillMode=process` + `OOMPolicy=continue`，给 ttyd 设 `OOMPolicy=continue`。装完无需重启服务，配置在下次停止或 OOM 时生效。
 
 ## 结构
 
@@ -80,7 +90,7 @@ ingress 结构（真实域名与 Tunnel ID 记在本地 `LOCAL.md`）：
 
 ## 安全
 
-1. **`.env` 永不上传**：已在 `.gitignore`；别人克隆后 `cp .env.example .env` 自己填密码/PIN。
+1. **`.env` 永不上传**：已在 `.gitignore`；别人克隆后 `cp .env.example .env` 自己填密码。
 2. **`LOCAL.md` 不入库**：真实域名、Tunnel ID、LaunchDaemon label 等本机私有信息只写在 `LOCAL.md`（已 gitignore）。
 3. 在 Cloudflare Zero Trust → Access 给域名加登录策略（推荐）。
 4. 仅监听 `127.0.0.1`，不暴露公网端口。

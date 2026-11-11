@@ -26,7 +26,6 @@ set +a
 : "${MANAGE_HOST:=127.0.0.1}"
 : "${MANAGE_PORT:=7690}"
 : "${TTYD_BASE_PATH:=/term}"
-: "${SESSION_PATH_ROOT:=${HOME}}"
 : "${SESSION_DEFAULT_PATH:=${HOME}}"
 # 浏览器端保留约 N 页滚动历史（滚轮本地回看）；按 50 行/页估算
 # .env 里的值是初始默认；管理页改过全局默认后以 run/scrollback-pages 为准
@@ -41,7 +40,7 @@ fi
 
 # 注意：不要 export 名为 TUNNEL_* 的变量，会干扰 cloudflared
 export ROOT ENV_FILE TTYD_USER TTYD_PASSWORD TTYD_HOST TTYD_PORT TMUX_SESSION PUBLIC_HOST USE_TMUX LOGIN_SHELL
-export MANAGE_HOST MANAGE_PORT TTYD_BASE_PATH SESSION_PATH_ROOT SESSION_DEFAULT_PATH SCROLLBACK_PAGES
+export MANAGE_HOST MANAGE_PORT TTYD_BASE_PATH SESSION_DEFAULT_PATH SCROLLBACK_PAGES
 TTYD_PID_FILE="${ROOT}/run/ttyd.pid"
 TUNNEL_PID_FILE="${ROOT}/run/cloudflared.pid"
 TTYD_LOG="${ROOT}/logs/ttyd.log"

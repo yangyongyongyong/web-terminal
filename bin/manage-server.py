@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""会话管理页 + API（7690）。进入终端需先登录（票据只签发给已登录用户）；工作目录受 SESSION_PATH_ROOT 限制。"""
+"""会话管理页 + API（7690）。进入终端需先登录（票据只签发给已登录用户）；工作目录不限范围（须存在）。"""
 from __future__ import annotations
 
 import base64
@@ -50,7 +50,6 @@ PUBLIC_HOST = ENV.get("PUBLIC_HOST", "term.example.com")  # 真实域名在 .env
 MANAGE_HOST = ENV.get("MANAGE_HOST", "127.0.0.1")
 MANAGE_PORT = int(ENV.get("MANAGE_PORT", "7690"))
 HOME = str(Path.home())
-PATH_ROOT = str(Path(ENV.get("SESSION_PATH_ROOT") or HOME).expanduser())
 DEFAULT_PATH = str(Path(ENV.get("SESSION_DEFAULT_PATH") or HOME).expanduser())
 SESSION_CTL = str(ROOT / "bin" / "session-ctl.sh")
 NAME_RE = re.compile(r"^[\w\-]{1,64}$")  # 含中文等 Unicode 字母数字；不含 . : / 空白
@@ -629,8 +628,7 @@ def _prune_hist_record(abs_path: str, user: str = "") -> None:
 
 
 # ---- 服务端文件浏览 / 预览 / 下载 ----
-# 浏览范围由 FS_PATH_ROOT 单独控制（默认 /，即全盘；可收紧到某个子目录），
-# 与 SESSION_PATH_ROOT（限制新建会话工作目录）互不影响。
+# 浏览范围由 FS_PATH_ROOT 单独控制（默认 /，即全盘；可收紧到某个子目录）。
 # 所有入口都先过 _fs_resolve：resolve 后必须仍在根内，防穿越/symlink 逃逸。
 FS_ROOT = Path(str(ENV.get("FS_PATH_ROOT") or "/")).expanduser().resolve()
 FS_LIST_MAX = 2000          # 单目录最多列出条目
@@ -1294,7 +1292,7 @@ __FAVICON__
 <script>
 const termBase = '/term/';
 let nameModalMode = null; // { type: 'create' } | { type: 'rename', oldName } | { type: 'clone', cwd, srcName }
-let cache = { sessions: [], history: [], path_root: '', default_path: '' };
+let cache = { sessions: [], history: [], default_path: '' };
 const rowSelected = new Set(); // name + \\u001e + cwd + \\u001e + live|dead
 let lastRowChkIndex = null; // 多选：普通点击锚点，供 Shift 范围选取
 let sortKey = 'status';
@@ -3825,7 +3823,6 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "sessions": filter_sessions_for(user, list_sessions()),
                     "history": filter_history_for(user, list_history()),
-                    "path_root": PATH_ROOT,
                     "default_path": DEFAULT_PATH,
                     "default_pages": default_pages(),
                     "env_default_pages": _env_default_pages(),
@@ -4679,7 +4676,7 @@ def main() -> None:
     httpd = ThreadingHTTPServer((MANAGE_HOST, MANAGE_PORT), Handler)
     start_lan_watcher()  # 后台每 20s 刷新局域网地址，避免页面显示过期 IP
     print(f"manage listening on http://{MANAGE_HOST}:{MANAGE_PORT}", flush=True)
-    print(f"path_root={PATH_ROOT} default_path={DEFAULT_PATH}", flush=True)
+    print(f"default_path={DEFAULT_PATH}", flush=True)
     print(f"lan_ip={detect_lan_ip() or '(未探测到)'}", flush=True)
     httpd.serve_forever()
 
