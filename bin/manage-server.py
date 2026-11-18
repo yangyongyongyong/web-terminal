@@ -1069,6 +1069,294 @@ p{{color:#8b9aab}}</style></head>
 <body><div class="box"><h1 style="font-size:17px;margin:0 0 8px">链接不可用</h1><p>{_html.escape(msg)}</p></div></body></html>"""
 
 
+# ---- 公共文件夹（临时公共网盘） ----
+# 所有登录用户共用；开关打开时生成一次性公网链接 /p/<token>，任何人无需登录
+# 即可上传/下载。关闭后链接立即失效，再次开启会换新 token（旧链接永久作废）。
+PUBLIC_DIR = Path(ENV.get("PUBLIC_DRIVE_DIR") or (ROOT / "run" / "public-drive")).expanduser()
+if not PUBLIC_DIR.is_absolute():
+    PUBLIC_DIR = ROOT / PUBLIC_DIR
+PUBLIC_DIR = PUBLIC_DIR.resolve()
+PUBLIC_STATE_FILE = ROOT / "run" / "public-drive.json"
+PUBLIC_MAX_BYTES = int(ENV.get("PUBLIC_DRIVE_MAX_FILE_MB") or "2048") * 1024 * 1024
+PUBLIC_QUOTA_BYTES = int(ENV.get("PUBLIC_DRIVE_QUOTA_MB") or "4096") * 1024 * 1024
+PUBLIC_LOCK = threading.Lock()
+_PUBLIC_NAME_BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def public_state_load() -> dict:
+    st = {"enabled": False, "token": "", "updated": "", "by": ""}
+    try:
+        obj = json.loads(PUBLIC_STATE_FILE.read_text(encoding="utf-8") or "{}")
+    except (OSError, json.JSONDecodeError):
+        return st
+    if isinstance(obj, dict):
+        st["enabled"] = bool(obj.get("enabled"))
+        token = str(obj.get("token") or "")
+        st["token"] = token if SHARE_TOKEN_RE.match(token) else ""
+        st["updated"] = str(obj.get("updated") or "")
+        st["by"] = str(obj.get("by") or "")
+    return st
+
+
+def public_state_save(st: dict) -> None:
+    PUBLIC_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PUBLIC_STATE_FILE.with_name(PUBLIC_STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+    try:
+        tmp.chmod(0o600)
+    except OSError:
+        pass
+    os.replace(tmp, PUBLIC_STATE_FILE)
+
+
+def public_open_token() -> str:
+    """当前有效的公网 token；未开启或数据不完整时返回空串。"""
+    st = public_state_load()
+    return st["token"] if st.get("enabled") and st.get("token") else ""
+
+
+def public_name_ok(name: str) -> bool:
+    """公共文件夹只接受扁平文件名：无路径分隔符、非隐藏文件、无控制字符。"""
+    if not name or len(name) > 200 or name in (".", ".."):
+        return False
+    if name.startswith(".") or _PUBLIC_NAME_BAD.search(name):
+        return False
+    return True
+
+
+def public_files() -> list[dict]:
+    try:
+        PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
+        entries = list(PUBLIC_DIR.iterdir())
+    except OSError:
+        return []
+    # 清理上传中断/进程崩溃留下的临时文件（隐藏文件不计入配额，但会占磁盘）
+    now = time.time()
+    for p in entries:
+        if p.name.startswith(".upload-") and p.name.endswith(".part"):
+            try:
+                if now - p.stat().st_mtime > 24 * 3600:
+                    p.unlink()
+            except OSError:
+                pass
+    items = []
+    for p in entries:
+        if p.name.startswith(".") or not p.is_file():
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        items.append({
+            "name": p.name,
+            "size": st.st_size,
+            "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+            "ts": int(st.st_mtime),
+        })
+    items.sort(key=lambda x: x["ts"], reverse=True)
+    return items
+
+
+def public_usage() -> int:
+    total = 0
+    try:
+        for p in PUBLIC_DIR.iterdir():
+            if p.name.startswith(".") or not p.is_file():
+                continue
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return total
+
+
+def public_save_stream(name: str, length: int, rfile) -> tuple[Path, int]:
+    """把请求体写入公共文件夹。先写隐藏临时文件，再原子改名；
+    配额检查在落盘后按实际大小做，避免并发上传把磁盘写满。"""
+    if not public_name_ok(name):
+        raise ValueError("文件名不合法（不支持路径、隐藏文件）")
+    if length <= 0:
+        raise ValueError("空文件")
+    if length > PUBLIC_MAX_BYTES:
+        raise ValueError(f"单个文件超过 {PUBLIC_MAX_BYTES // (1024 * 1024)}MB 上限")
+    PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PUBLIC_DIR / f".upload-{uuid.uuid4().hex}.part"
+    written = 0
+    try:
+        with tmp.open("wb") as f:
+            while written < length:
+                chunk = rfile.read(min(UPLOAD_BLOCK, length - written))
+                if not chunk:
+                    break
+                f.write(chunk)
+                written += len(chunk)
+        if written != length:
+            raise ConnectionError(f"上传中断：收到 {written}/{length} 字节")
+        with PUBLIC_LOCK:
+            used = public_usage()
+            if used + written > PUBLIC_QUOTA_BYTES:
+                raise PermissionError(
+                    f"公共文件夹空间不足（已用 {_fmt_bytes(used)} / 上限 {_fmt_bytes(PUBLIC_QUOTA_BYTES)}）"
+                )
+            dest = _unique_dest(PUBLIC_DIR, name)
+            os.replace(tmp, dest)
+        return dest, written
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def public_delete(name: str) -> bool:
+    if not public_name_ok(name):
+        raise ValueError("文件名不合法")
+    p = PUBLIC_DIR / name
+    if not p.is_file():
+        return False
+    p.unlink()
+    return True
+
+
+def render_public_page(token: str, files: list[dict], used: int, quota: int) -> str:
+    """公开上传/下载页：手机优先，单文件流式上传，不依赖第三方 CDN。"""
+    rows = []
+    for f in files:
+        name_q = quote(f["name"], safe="")
+        rows.append(
+            f'<li><span class="pname">{_html.escape(f["name"])}</span>'
+            f'<span class="pmeta">{_fmt_bytes(f["size"])} · {_html.escape(f["mtime"])}</span>'
+            f'<a class="pbtn" href="/p/{_html.escape(token)}/download?name={name_q}">下载</a></li>'
+        )
+    listing = "".join(rows) or '<li class="empty">还没有文件，上传一个吧</li>'
+    pct = min(100, int(used * 100 / quota)) if quota > 0 else 0
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>公共文件夹 · 临时共享</title>
+<style>
+  :root {{ color-scheme: dark; --line:#2a3542; --muted:#8b9aab; --accent:#3d8bfd; }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; background:#0f1419; color:#e7ecf1;
+         font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+         padding:16px 14px calc(28px + env(safe-area-inset-bottom)); }}
+  .wrap {{ max-width:720px; margin:0 auto; }}
+  h1 {{ font-size:20px; margin:0 0 4px; }}
+  .sub {{ color:var(--muted); font-size:13px; }}
+  .card {{ background:#1a222c; border:1px solid var(--line); border-radius:14px;
+           padding:14px; margin-top:14px; }}
+  .usagebar {{ height:6px; background:#0f1419; border-radius:3px; overflow:hidden; margin:8px 0 4px; }}
+  .usagebar i {{ display:block; height:100%; background:var(--accent); width:{pct}%; }}
+  .pick {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
+  label.btn, button.btn {{ display:inline-flex; align-items:center; justify-content:center;
+    min-height:44px; padding:0 16px; border-radius:10px; background:var(--accent); color:#fff;
+    font-weight:600; font-size:15px; border:0; cursor:pointer; }}
+  label.btn:active, button.btn:active {{ filter:brightness(.92); }}
+  #prog {{ color:var(--muted); font-size:13px; min-height:18px; }}
+  ul {{ list-style:none; margin:0; padding:0; }}
+  li {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+        padding:11px 0; border-bottom:1px solid rgba(255,255,255,.06); }}
+  li:last-child {{ border-bottom:0; }}
+  li.empty {{ color:var(--muted); justify-content:center; padding:18px 0; }}
+  .pname {{ flex:1 1 200px; min-width:0; word-break:break-all; }}
+  .pmeta {{ color:var(--muted); font-size:12px; white-space:nowrap; }}
+  a.pbtn {{ display:inline-flex; align-items:center; min-height:38px; padding:0 14px;
+            border-radius:9px; background:#25406b; color:#cfe1ff; text-decoration:none;
+            font-size:14px; font-weight:600; }}
+  .drop {{ border:1px dashed #35506f; border-radius:12px; padding:14px; text-align:center;
+           color:var(--muted); font-size:13px; margin-top:10px; }}
+  .drop.over {{ border-color:var(--accent); color:#cfe1ff; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>公共文件夹</h1>
+  <div class="sub">临时共享 · 上传和下载都无需登录；分享者随时可能关闭</div>
+
+  <div class="card">
+    <div class="pick">
+      <label class="btn" for="file">选择文件上传</label>
+      <input id="file" type="file" multiple hidden>
+      <span class="sub">可多选，手机上可从相册/文件选择</span>
+    </div>
+    <div id="prog"></div>
+    <div class="drop" id="drop">也可以把文件拖到这里</div>
+    <div class="usagebar"><i></i></div>
+    <div class="sub">已用 {_fmt_bytes(used)} / {_fmt_bytes(quota)} · 单文件上限 {_fmt_bytes(PUBLIC_MAX_BYTES)}</div>
+  </div>
+
+  <div class="card">
+    <div class="sub" style="margin-bottom:6px">共 {len(files)} 个文件</div>
+    <ul id="list">{listing}</ul>
+  </div>
+</div>
+<script>
+(function () {{
+  var base = '/p/{_html.escape(token)}';
+  var input = document.getElementById('file');
+  var prog = document.getElementById('prog');
+  var drop = document.getElementById('drop');
+  var queue = [], busy = false;
+
+  function addFiles(list) {{
+    for (var i = 0; i < list.length; i++) if (list[i] && list[i].size >= 0) queue.push(list[i]);
+    run();
+  }}
+
+  function run() {{
+    if (busy || !queue.length) return;
+    busy = true;
+    var f = queue.shift();
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', base + '/upload?name=' + encodeURIComponent(f.name));
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = function (e) {{
+      if (e.lengthComputable) prog.textContent = '上传 ' + f.name + ' ' + Math.round(e.loaded * 100 / e.total) + '%';
+    }};
+    xhr.onload = function () {{
+      if (xhr.status === 200) {{
+        prog.textContent = '已上传 ' + f.name;
+        setTimeout(function () {{ if (!queue.length) location.reload(); }}, 120);
+      }} else {{
+        var msg = '上传失败';
+        try {{ msg = JSON.parse(xhr.responseText).error || msg; }} catch (e) {{}}
+        prog.textContent = f.name + '：' + msg;
+        setTimeout(function () {{ prog.textContent = ''; }}, 4000);
+      }}
+      busy = false;
+      run();
+    }};
+    xhr.onerror = function () {{
+      prog.textContent = f.name + '：网络错误';
+      busy = false;
+      run();
+    }};
+    xhr.send(f);
+  }}
+
+  input.addEventListener('change', function () {{
+    addFiles(input.files);
+    input.value = '';
+  }});
+  ['dragenter', 'dragover'].forEach(function (ev) {{
+    drop.addEventListener(ev, function (e) {{ e.preventDefault(); drop.classList.add('over'); }});
+  }});
+  ['dragleave', 'drop'].forEach(function (ev) {{
+    drop.addEventListener(ev, function (e) {{ e.preventDefault(); drop.classList.remove('over'); }});
+  }});
+  drop.addEventListener('drop', function (e) {{
+    if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+  }});
+}})();
+</script>
+</body>
+</html>"""
+
+
+
 MANAGE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1284,6 +1572,27 @@ __FAVICON__
     padding: 3px 9px; font-size: 12px; background: #2b3645; color: var(--text); margin-right: 4px;
   }
   .fslist button.op2:hover { background: var(--accent); }
+  /* 公共文件夹：列表用 flex 行，窄屏自动换行，手机可点 */
+  .publist { list-style: none; margin: 0; padding: 0; }
+  .publist li { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 2px; border-bottom: 1px solid rgba(255,255,255,.05); }
+  .publist li:last-child { border-bottom: 0; }
+  .publist li.empty { color: var(--muted); justify-content: center; padding: 16px 0; }
+  .publist .pname { flex: 1 1 200px; min-width: 0; word-break: break-all; }
+  .publist .pmeta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .publist .pacts { display: flex; gap: 8px; margin-left: auto; }
+  .publist .pacts a.op2 { text-decoration: none; display: inline-flex; align-items: center; }
+  label.btnfile { display: inline-flex; align-items: center; justify-content: center; min-height: 38px;
+                  padding: 0 14px; border-radius: 8px; background: var(--accent); color: #fff;
+                  font-weight: 600; cursor: pointer; }
+  label.btnfile:active { filter: brightness(.92); }
+  .pubdrop { border: 1px dashed var(--line); border-radius: 10px; padding: 14px; text-align: center;
+             color: var(--muted); font-size: 13px; margin: 10px 0; }
+  .pubdrop.over { border-color: var(--accent); color: var(--text); }
+  .publist .op2 { appearance: none; border: 0; cursor: pointer; border-radius: 6px;
+                  padding: 4px 10px; font-size: 12px; background: #2b3645; color: var(--text);
+                  text-decoration: none; display: inline-flex; align-items: center; }
+  .publist .op2:hover { background: var(--accent); }
+  .btnlink { color: var(--accent); text-decoration: none; font-size: 13px; }
   .fsview-mask {
     position: fixed; inset: 0; background: rgba(5,8,12,.82);
     z-index: 10050; display: flex; align-items: center; justify-content: center;
@@ -1359,6 +1668,7 @@ __FAVICON__
     <a class="navitem" data-view="upload" href="#upload">上传</a>
     <a class="navitem" data-view="files" href="#files">下载</a>
     <a class="navitem" data-view="shares" href="#shares">分享</a>
+    <a class="navitem" data-view="public" href="#public">公共文件夹</a>
     <a class="navitem" data-view="llm" href="#llm">接入 AI</a>
     <a class="navitem" data-view="users" href="#users" id="navUsers" hidden>用户管理</a>
   </nav>
@@ -1449,6 +1759,39 @@ __FAVICON__
     </div>
     <p class="sub" style="margin:8px 0">文件夹会打包为 zip 下载；停止分享后链接立即失效。删除文件或改路径也会让链接自动失效。</p>
     <div id="shList" class="fslist"><p class="empty">加载中…</p></div>
+  </section>
+  </div>
+
+  <div class="view" data-view="public" hidden>
+    <h1 class="viewtitle">公共文件夹</h1>
+  <section class="card">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2 style="margin:0;font-size:16px">临时公共网盘 <span class="sub" style="font-size:12px;font-weight:400">登录用户都可见；可临时开放给任何人</span></h2>
+      <div class="actions">
+        <button id="pubRefresh" class="secondary" type="button">刷新</button>
+        <button id="pubToggle" type="button">开启公网访问</button>
+      </div>
+    </div>
+    <div id="pubUrlRow" class="row" hidden style="margin:10px 0">
+      <input id="pubUrl" type="text" readonly autocomplete="off" spellcheck="false">
+      <button id="pubCopy" class="secondary" type="button">复制链接</button>
+      <a id="pubOpen" class="btnlink" href="#" target="_blank" rel="noopener" style="align-self:center">打开</a>
+    </div>
+    <p id="pubHint" class="sub" style="margin:8px 0"></p>
+    <div class="row" style="margin:10px 0;align-items:center">
+      <label class="btnfile" for="pubFileInput">选择文件上传</label>
+      <input id="pubFileInput" type="file" multiple hidden>
+      <span id="pubProgress" class="sub"></span>
+    </div>
+    <div id="pubDrop" class="pubdrop">拖放文件到这里（手机可点上面的按钮选择）</div>
+    <div id="pubUsage" class="sub" style="margin-top:8px"></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2 style="margin:0;font-size:16px">文件</h2>
+    </div>
+    <ul id="pubList" class="publist"><li class="empty">加载中…</li></ul>
   </section>
   </div>
 
@@ -2260,7 +2603,7 @@ document.getElementById('llmCopy').onclick = async () => {
 };
 
 // ---- 侧边栏视图切换 ----
-const VIEWS = ['sessions', 'upload', 'files', 'shares', 'llm', 'users'];
+const VIEWS = ['sessions', 'upload', 'files', 'shares', 'public', 'llm', 'users'];
 let isAdmin = false;
 let usersLoaded = false;
 let currentView = '';
@@ -2282,6 +2625,7 @@ function showView(v, opts) {
   }
   if (v === 'sessions') window.dispatchEvent(new Event('wt-view-sessions'));
   if (v === 'shares') window.dispatchEvent(new Event('wt-view-shares'));
+  if (v === 'public') window.dispatchEvent(new Event('wt-view-public'));
 }
 
 function initialView() {
@@ -3076,6 +3420,140 @@ function renderShares() {
   };
   window.addEventListener('wt-view-shares', () => loadShares());
   if (currentView === 'shares') loadShares();
+})();
+
+// ---- 公共文件夹（临时公共网盘） ----
+let pubInfo = { enabled: false, url: '', files: [], used: 0, quota: 0, max_file: 0 };
+
+async function loadPublic() {
+  const listEl = document.getElementById('pubList');
+  if (!listEl) return;
+  try {
+    pubInfo = await api('/api/public');
+    renderPublic();
+  } catch (e) {
+    listEl.innerHTML = '<li class="empty">加载失败: ' + esc(String(e.message || e)) + '</li>';
+  }
+}
+
+function renderPublic() {
+  const on = !!pubInfo.enabled;
+  const btn = document.getElementById('pubToggle');
+  btn.textContent = on ? '关闭公网访问' : '开启公网访问';
+  btn.classList.toggle('danger', on);
+  document.getElementById('pubUrlRow').hidden = !on;
+  if (on) {
+    document.getElementById('pubUrl').value = location.origin + pubInfo.url;
+    document.getElementById('pubOpen').href = pubInfo.url;
+  }
+  document.getElementById('pubHint').textContent = on
+    ? '任何人拿到这个链接都能上传和下载（无需登录）。用完请点「关闭公网访问」，链接立即失效。'
+    : '当前未开放公网访问：只有已登录用户能在本页上传/下载。';
+  document.getElementById('pubUsage').textContent =
+    '已用 ' + fmtBytes(pubInfo.used) + ' / ' + fmtBytes(pubInfo.quota) +
+    ' · 单文件上限 ' + fmtBytes(pubInfo.max_file) +
+    ' · 共 ' + ((pubInfo.files || []).length) + ' 个文件';
+  const files = pubInfo.files || [];
+  const listEl = document.getElementById('pubList');
+  if (!files.length) { listEl.innerHTML = '<li class="empty">还没有文件</li>'; return; }
+  listEl.innerHTML = files.map(f =>
+    '<li data-name="' + esc(f.name) + '">' +
+      '<span class="pname">' + esc(f.name) + '</span>' +
+      '<span class="pmeta">' + esc(fmtBytes(f.size)) + ' · ' + esc(f.mtime) + '</span>' +
+      '<span class="pacts">' +
+        '<a class="op2" href="/api/public/download?name=' + encodeURIComponent(f.name) + '">下载</a>' +
+        '<button class="op2" type="button" data-act="del">删除</button>' +
+      '</span></li>'
+  ).join('');
+}
+
+(function initPublicView() {
+  const input = document.getElementById('pubFileInput');
+  const drop = document.getElementById('pubDrop');
+  const prog = document.getElementById('pubProgress');
+  if (!input) return;
+  let queue = [];
+  let busy = false;
+
+  function addFiles(files) {
+    const list = Array.from(files || []).filter(f => f && f.size > 0);
+    if (!list.length) { prog.textContent = '没有可上传的文件'; return; }
+    for (const f of list) queue.push(f);
+    run();
+  }
+
+  function run() {
+    if (busy || !queue.length) return;
+    busy = true;
+    const f = queue.shift();
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/public/upload?name=' + encodeURIComponent(f.name));
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable) prog.textContent = '上传 ' + f.name + ' ' + Math.round(e.loaded * 100 / e.total) + '%';
+    };
+    xhr.onload = () => {
+      busy = false;
+      if (xhr.status !== 200) {
+        let msg = 'HTTP ' + xhr.status;
+        try { msg = JSON.parse(xhr.responseText).error || msg; } catch (e) {}
+        prog.textContent = f.name + '：' + msg;
+      } else {
+        prog.textContent = '已上传 ' + f.name;
+      }
+      if (!queue.length) { setTimeout(loadPublic, 250); setTimeout(() => { prog.textContent = ''; }, 1800); }
+      run();
+    };
+    xhr.onerror = () => { busy = false; prog.textContent = f.name + '：网络错误'; run(); };
+    xhr.send(f);
+  }
+
+  input.addEventListener('change', () => { addFiles(input.files); input.value = ''; });
+  ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => {
+    e.preventDefault(); drop.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => {
+    e.preventDefault(); drop.classList.remove('over');
+  }));
+  drop.addEventListener('drop', e => { if (e.dataTransfer) addFiles(e.dataTransfer.files); });
+
+  document.getElementById('pubRefresh').onclick = loadPublic;
+  document.getElementById('pubToggle').onclick = async () => {
+    const turnOn = !pubInfo.enabled;
+    if (!turnOn && !confirm('关闭后公网链接立即失效，确定吗？')) return;
+    try {
+      await api('/api/public/toggle', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: turnOn }),
+      });
+      flash(turnOn ? '已开启公网访问，链接已生成' : '已关闭公网访问');
+      await loadPublic();
+    } catch (e) { flash('操作失败: ' + (e.message || e), true); }
+  };
+  document.getElementById('pubCopy').onclick = async () => {
+    const b = document.getElementById('pubCopy');
+    const ok = await copyShareText(document.getElementById('pubUrl').value);
+    b.textContent = ok ? '已复制 ✓' : '复制失败';
+    setTimeout(() => { b.textContent = '复制链接'; }, 1600);
+  };
+  document.getElementById('pubList').addEventListener('click', async ev => {
+    const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-act="del"]') : null;
+    if (!btn) return;
+    const li = btn.closest('li');
+    const name = li && li.getAttribute('data-name');
+    if (!name) return;
+    if (!confirm('删除「' + name + '」？此操作不可恢复。')) return;
+    try {
+      await api('/api/public/delete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name }),
+      });
+      flash('已删除 ' + name);
+      await loadPublic();
+    } catch (e) { flash('删除失败: ' + (e.message || e), true); }
+  });
+  window.addEventListener('wt-view-public', () => loadPublic());
+  if (currentView === 'public') loadPublic();
 })();
 </script>
 </body>
@@ -3994,8 +4472,8 @@ class Handler(BaseHTTPRequestHandler):
     wt_user: str = USER
 
     def log_message(self, fmt: str, *args) -> None:
-        # 分享链接的 token 等同口令，别原样落日志
-        msg = re.sub(r"/s/[A-Za-z0-9_-]{16,64}", "/s/<token>", fmt % args)
+        # 分享/公共文件夹的 token 等同口令，别原样落日志
+        msg = re.sub(r"/([sp])/[A-Za-z0-9_-]{16,64}", r"/\1/<token>", fmt % args)
         sys.stderr.write("%s - %s\n" % (self.address_string(), msg))
 
     def _unauthorized(self) -> None:
@@ -4189,6 +4667,105 @@ class Handler(BaseHTTPRequestHandler):
             target = term_url(internal, ticket)
         self._redirect(target)
 
+    # ---- 公共文件夹 ----
+    def _public_token_ok(self, token: str) -> bool:
+        cur = public_open_token()
+        return bool(cur) and hmac.compare_digest(cur, token or "")
+
+    def _serve_public_file(self, token: str, name: str) -> None:
+        if not public_name_ok(name):
+            self._html(400, render_share_error("文件名不合法"))
+            return
+        p = PUBLIC_DIR / name
+        try:
+            if not p.is_file():
+                self._html(404, render_share_error("文件已不存在"))
+                return
+            size = p.stat().st_size
+        except OSError:
+            self._html(404, render_share_error("文件不可读"))
+            return
+        if size > FS_DOWNLOAD_MAX:
+            self._html(400, render_share_error("文件超过 2GB，暂不支持下载"))
+            return
+        quoted = quote(name)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition",
+                         f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
+        self.end_headers()
+        try:
+            with p.open("rb") as f:
+                while True:
+                    chunk = f.read(UPLOAD_BLOCK)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _handle_public_get(self, path: str, qs: dict[str, list[str]]) -> None:
+        """公开页 /p/<token>；下载 /p/<token>/download?name=。开关关闭后一律 404。"""
+        parts = [p for p in path.split("/") if p]
+        bad = len(parts) < 2 or len(parts) > 3 or (len(parts) == 3 and parts[2] != "download")
+        if bad:
+            self._html(404, render_share_error("链接格式不正确"))
+            return
+        token = parts[1]
+        if not self._public_token_ok(token):
+            self._html(404, render_share_error("公共文件夹已关闭或链接已失效"))
+            return
+        if len(parts) == 3:
+            self._serve_public_file(token, (qs.get("name") or [""])[0])
+            return
+        self._html(200, render_public_page(token, public_files(), public_usage(), PUBLIC_QUOTA_BYTES))
+
+    def _public_upload_response(self, qs: dict[str, list[str]]) -> None:
+        """处理公共文件夹上传（公开页与登录页共用）。请求体是原始字节流。"""
+        name = (qs.get("name") or [""])[0]
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self.close_connection = True
+            self._json(400, {"error": "空请求或缺少 Content-Length"})
+            return
+        if length > PUBLIC_MAX_BYTES:
+            self.close_connection = True   # 不读请求体，直接断开
+            self._json(413, {"error": f"单个文件超过 {PUBLIC_MAX_BYTES // (1024 * 1024)}MB 上限"})
+            return
+        try:
+            dest, written = public_save_stream(name, length, self.rfile)
+        except PermissionError as e:
+            self._json(413, {"error": str(e)})
+            return
+        except ConnectionError as e:
+            self.close_connection = True
+            self._json(400, {"error": str(e)})
+            return
+        except (ValueError, OSError) as e:
+            self.close_connection = True
+            self._json(400 if isinstance(e, ValueError) else 500, {"error": str(e)})
+            return
+        sys.stderr.write(f"[public] upload {dest.name} ({written} bytes) from {self.client_address[0]}\n")
+        self._json(200, {"ok": True, "name": dest.name, "bytes": written})
+
+    def _handle_public_post(self, path: str, qs: dict[str, list[str]]) -> None:
+        parts = [p for p in path.split("/") if p]
+        if len(parts) != 3 or parts[2] != "upload":
+            self.close_connection = True
+            self._json(404, {"error": "not found"})
+            return
+        if not self._public_token_ok(parts[1]):
+            self.close_connection = True
+            self._json(404, {"error": "公共文件夹已关闭或链接已失效"})
+            return
+        self._public_upload_response(qs)
+
     def _handle_share(self, path: str) -> None:
         """公开分享（免登录）：/s/<token> 落地页，/s/<token>/download 下载。
         只按 token 查记录、重新解析路径，不接受任何用户传入的路径。"""
@@ -4336,12 +4913,37 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_share(path)
             return
 
+        # 公共文件夹（临时公共网盘）：/p/<token>
+        if path.startswith("/p/"):
+            self._handle_public_get(path, qs)
+            return
+
         if not self._check_auth():
             return
 
         if path == "/api/shares":
             self._json(200, {"shares": share_list(self.wt_user),
                              "can_all": is_primary(self.wt_user)})
+            return
+
+        if path == "/api/public":
+            st = public_state_load()
+            token = st["token"] if st.get("enabled") and st.get("token") else ""
+            self._json(200, {
+                "enabled": bool(token),
+                "token": token,
+                "url": f"/p/{token}" if token else "",
+                "by": st.get("by") or "",
+                "updated": st.get("updated") or "",
+                "files": public_files(),
+                "used": public_usage(),
+                "quota": PUBLIC_QUOTA_BYTES,
+                "max_file": PUBLIC_MAX_BYTES,
+            })
+            return
+
+        if path == "/api/public/download":
+            self._serve_public_file("", (qs.get("name") or [""])[0])
             return
 
         if path == "/api/users":
@@ -4767,6 +5369,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        qs = parse_qs(parsed.query)
+        # 公共文件夹上传：匿名，按路径里的 token 校验
+        if path.startswith("/p/"):
+            self._handle_public_post(path, qs)
+            return
         # 登录：未认证即可调用，是获取登录态的唯一入口
         if path == "/api/login":
             self._handle_login()
@@ -4774,6 +5381,11 @@ class Handler(BaseHTTPRequestHandler):
         # 文件上传：请求体是原始字节流，必须在此分流，不能走下面的 JSON 解析
         if path == "/api/upload":
             self._handle_upload()
+            return
+        if path == "/api/public/upload":
+            if not self._check_auth():
+                return
+            self._public_upload_response(qs)
             return
         if path == "/api/upload-batch":
             if not self._check_auth():
@@ -4788,6 +5400,33 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8") or "{}")
         except json.JSONDecodeError:
             data = {}
+
+        if path == "/api/public/toggle":
+            want = bool(data.get("enabled"))
+            st = public_state_load()
+            st["enabled"] = want
+            # 每次开启都换新 token：上一次的链接永久作废，适合「用完就关」
+            st["token"] = secrets.token_urlsafe(24) if want else ""
+            st["by"] = self.wt_user
+            st["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            public_state_save(st)
+            sys.stderr.write(f"[public] {self.wt_user} {'开启' if want else '关闭'}公网访问\n")
+            self._json(200, {"ok": True, "enabled": st["enabled"],
+                             "url": f"/p/{st['token']}" if st["enabled"] else ""})
+            return
+
+        if path == "/api/public/delete":
+            name = str(data.get("name") or "")
+            try:
+                removed = public_delete(name)
+            except (ValueError, OSError) as e:
+                self._json(400, {"error": str(e)})
+                return
+            if not removed:
+                self._json(404, {"error": "文件不存在"})
+                return
+            self._json(200, {"ok": True, "files": public_files(), "used": public_usage()})
+            return
 
         if path == "/api/users":
             if not is_primary(self.wt_user):

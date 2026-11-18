@@ -6,3 +6,4 @@ cd "${ROOT}"
 python3 tests/test_wheel_regression.py
 python3 tests/test_paste_image.py
 python3 tests/test_auto_update.py
+python3 tests/test_public_drive.py
