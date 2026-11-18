@@ -23,6 +23,7 @@
 - **标签页图标**：终端页（绿）/ 管理页（蓝）各有高对比 favicon —— ttyd 自带图标是黑底黑字，深色标签栏里等于没图标
 - **粘贴图片**：按客户端系统分流键位 —— macOS 客户端 `⌘V`/`Ctrl+V` 贴图（沿用本机剪贴板）；Windows/Linux 客户端 `Ctrl+V` 贴文本、`Alt+V` 贴图（剪贴板 API 不可用时弹引导浮层）、`Ctrl+Alt+V` 发原始 `^V` 给 vim 等
 - **回看页数**：管理页「全局回看」设全局默认（存 `run/scrollback-pages`，即时生效）；每个会话可单独配置，留空/点「跟随全局」即不配置、自动跟随全局默认
+- **文件分享**：「下载」和「上传」里每个文件/文件夹都有「分享」，生成 `/s/<token>` 链接；拿到链接的人**无需登录**即可下载（文件夹自动打包 zip），侧边栏「分享」可查看、复制、单个或批量停止。分享记录存 `run/shares.json`，删除文件或停止分享后链接立即失效
 
 ## 依赖
 
@@ -67,6 +68,32 @@ sudo ./bin/install-systemd-dropins.sh   # 含 20-memory-limit.conf
 ```
 
 `config/systemd/web-terminal-manage.service.d/20-memory-limit.conf` 给整个会话组设额度：`MemoryHigh=2G`（软限，超出只回收不杀）、`MemoryMax=2500M`（硬限，超出仅在 unit 内 OOM）、`MemorySwapMax=1500M`（防止一个会话吃光 swap）。要跑更大的构建，调高这三个值即可。
+
+### 自动更新与回滚
+
+定时检查 GitHub 上的 `AUTO_UPDATE_BRANCH`，有新提交就快进拉取并重启；重启后健康检查不通过则自动回退，最多回退 `AUTO_UPDATE_MAX_ROLLBACK` 个版本，并防止同一个坏版本被反复升级（失败黑名单 + 静默期）。
+
+```bash
+sudo ./bin/install-autoupdate.sh          # 安装并启用 systemd timer
+sudo ./bin/install-autoupdate.sh --disable
+./bin/auto-update.py --check              # 只检查是否有更新
+./bin/auto-update.py --force              # 忽略暂停/静默期（仍遵守黑名单）
+./bin/auto-update.py --resume             # 人工清除暂停、黑名单、静默期
+```
+
+配置在 `.env`：`AUTO_UPDATE_INTERVAL_MIN`（检查间隔，分钟）、`AUTO_UPDATE_COOLDOWN_MIN`（静默期，分钟）、`AUTO_UPDATE_MAX_ROLLBACK`（最多回退版本数）、`AUTO_UPDATE_HEALTH_TIMEOUT`（重启后等待健康的秒数）、`AUTO_UPDATE_BRANCH` / `AUTO_UPDATE_REMOTE`、`AUTO_UPDATE_ENABLED`。
+
+行为与安全边界：
+
+- 只做 `git merge --ff-only` 快进；本地有未提交改动、未推送提交或已分叉时一律跳过，不会强推或覆盖本地
+- 健康检查 = `web-terminal-ttyd` / `web-terminal-manage` 两个 unit active，且管理页 `/` 与 ttyd `${TTYD_BASE_PATH}/` 可访问
+- 健康检查失败的目标提交写入黑名单：远程没有更新的提交时不再重试，避免「版本 1↔2 反复升降级」
+- 每次更新或回滚后进入静默期，期间不再动作
+- 回滚顺序：上次健康版本 → 坏版本的 `~1`、`~2`…，最多 `AUTO_UPDATE_MAX_ROLLBACK` 次；全部失败则置 `paused` 停止自动更新，等待人工 `--resume`
+- 状态文件 `run/auto-update-state.json`，日志 `logs/auto-update.log`
+- 测试：`python3 tests/test_auto_update.py`（覆盖更新成功、回滚、继续回退、黑名单、静默期、暂停/恢复、脏工作区、本地领先等 10 个用例）
+
+macOS 没有 systemd 时，可用 launchd/cron 定期执行 `bin/auto-update.py`；脚本会自动改用 `bin/safe-restart.sh` 重启服务。
 
 ## 结构
 

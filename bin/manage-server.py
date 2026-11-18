@@ -6,10 +6,12 @@ import base64
 import gzip
 import hashlib
 import hmac
+import html as _html
 import importlib.util
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import stat as _stat
@@ -862,6 +864,211 @@ def fs_list(rel: str) -> dict:
             "total": total, "truncated": total > len(items), "items": items}
 
 
+# ---- 文件分享：免登录下载链接 ----
+# 记录存 run/shares.json：token → {rel, name, kind, by, created, hits, last}
+# rel 是相对 FS_PATH_ROOT 的路径；每次访问都重新过 _fs_resolve，
+# 所以文件删了、换成指向根外的软链接、或改了 FS_PATH_ROOT，链接自动失效。
+SHARES_FILE = ROOT / "run" / "shares.json"
+SHARES_LOCK = threading.Lock()
+SHARE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+
+def _shares_load() -> dict[str, dict]:
+    try:
+        obj = json.loads(SHARES_FILE.read_text(encoding="utf-8") or "{}")
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    return {str(k): v for k, v in obj.items() if isinstance(v, dict) and SHARE_TOKEN_RE.match(str(k))}
+
+
+def _shares_write(data: dict[str, dict]) -> None:
+    SHARES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SHARES_FILE.with_name(SHARES_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    try:
+        tmp.chmod(0o600)
+    except OSError:
+        pass
+    os.replace(tmp, SHARES_FILE)
+
+
+def share_create(raw: str, user: str) -> dict:
+    """创建分享；同一用户对同一路径重复点击复用已有 token。"""
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("缺少路径")
+    if raw.startswith("/") or raw.startswith("~"):
+        rel = _fs_rel_from_abs(raw)      # 绝对路径/~/ 开头：先归一到根内相对路径
+    else:
+        rel = raw.strip("/")
+    if not rel:
+        raise ValueError("不能分享根目录")
+    p = _fs_resolve(rel)
+    if p == FS_ROOT:
+        raise ValueError("不能分享根目录")
+    if not p.exists():
+        raise FileNotFoundError("文件或文件夹不存在")
+    # 归一为解析后的根内相对路径：挡住 ".."、多余层级和软链接别名，
+    # 也保证「同一文件」不会因为写法不同而重复分享。
+    rel = str(p.relative_to(FS_ROOT))
+    kind = "dir" if p.is_dir() else "file"
+    with SHARES_LOCK:
+        data = _shares_load()
+        for token, sh in data.items():
+            if str(sh.get("rel") or "") == rel and str(sh.get("by") or "") == user:
+                return {"token": token, "rel": rel, "name": sh.get("name") or p.name,
+                        "kind": sh.get("kind") or kind, "existing": True}
+        token = secrets.token_urlsafe(24)
+        rec = {"rel": rel, "name": p.name, "kind": kind, "by": user,
+               "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "hits": 0}
+        data[token] = rec
+        _shares_write(data)
+    return {"token": token, **rec, "existing": False}
+
+
+def share_list(user: str) -> list[dict]:
+    with SHARES_LOCK:
+        data = _shares_load()
+    out = []
+    for token, sh in data.items():
+        by = str(sh.get("by") or "")
+        if by != user and not is_primary(user):
+            continue
+        rel = str(sh.get("rel") or "")
+        missing = True
+        try:
+            missing = not rel or not _fs_resolve(rel).exists()
+        except ValueError:
+            missing = True
+        out.append({
+            "token": token, "rel": rel,
+            "name": sh.get("name") or (Path(rel).name if rel else ""),
+            "kind": sh.get("kind") or "", "by": by,
+            "created": sh.get("created") or "",
+            "hits": int(sh.get("hits") or 0),
+            "last": sh.get("last") or "",
+            "missing": missing,
+        })
+    out.sort(key=lambda x: str(x.get("created") or ""), reverse=True)
+    return out
+
+
+def share_revoke(tokens: list[str], user: str) -> int:
+    allowed = {t for t in tokens if isinstance(t, str) and SHARE_TOKEN_RE.match(t)}
+    if not allowed:
+        return 0
+    with SHARES_LOCK:
+        data = _shares_load()
+        removed = 0
+        for token in list(data):
+            if token not in allowed:
+                continue
+            by = str(data[token].get("by") or "")
+            if by != user and not is_primary(user):
+                continue
+            data.pop(token, None)
+            removed += 1
+        if removed:
+            _shares_write(data)
+    return removed
+
+
+def share_lookup(token: str) -> dict | None:
+    if not SHARE_TOKEN_RE.match(token or ""):
+        return None
+    with SHARES_LOCK:
+        return _shares_load().get(token)
+
+
+def share_hit(token: str) -> None:
+    """记一次下载（用于分享管理里的访问次数）。"""
+    with SHARES_LOCK:
+        data = _shares_load()
+        sh = data.get(token)
+        if not sh:
+            return
+        sh["hits"] = int(sh.get("hits") or 0) + 1
+        sh["last"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        try:
+            _shares_write(data)
+        except OSError:
+            pass
+
+
+def share_rel_map(user: str) -> dict[str, str]:
+    """该用户已分享的 rel → token，供文件列表标记「已分享」。"""
+    with SHARES_LOCK:
+        data = _shares_load()
+    return {
+        str(sh.get("rel") or ""): token
+        for token, sh in data.items()
+        if str(sh.get("by") or "") == user and sh.get("rel")
+    }
+
+
+def _fmt_bytes(n: int) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return (f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}")
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def render_share_page(name: str, token: str, kind: str, size: int) -> str:
+    """公开分享页：只显示文件名/大小和一个下载按钮，不暴露服务器路径。"""
+    shown = _html.escape(name or "下载")
+    if kind == "dir":
+        meta = "文件夹 · 下载时自动打包为 zip"
+    else:
+        meta = f"文件 · {_fmt_bytes(size)}"
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{shown} · 下载</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#0f1419; color:#e7ecf1;
+         font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }}
+  .box {{ width:min(520px, calc(100vw - 40px)); background:#1a222c; border:1px solid #2a3542;
+          border-radius:14px; padding:28px 26px; box-shadow:0 12px 40px rgba(0,0,0,.4); }}
+  h1 {{ margin:0 0 6px; font-size:18px; word-break:break-all; }}
+  .meta {{ color:#8b9aab; font-size:13px; margin-bottom:20px; }}
+  a.btn {{ display:inline-block; padding:10px 20px; border-radius:8px; background:#3d8bfd;
+           color:#fff; text-decoration:none; font-weight:600; }}
+  a.btn:hover {{ filter:brightness(1.1); }}
+  .tip {{ margin-top:16px; color:#6f7f90; font-size:12px; }}
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>{shown}</h1>
+    <div class="meta">{_html.escape(meta)}</div>
+    <a class="btn" href="/s/{_html.escape(token)}/download">下载</a>
+    <div class="tip">此链接由分享者创建，可能随时失效；拿到链接的人无需登录即可下载。</div>
+  </div>
+</body>
+</html>"""
+
+
+def render_share_error(msg: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow"><title>链接不可用</title>
+<style>body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:#0f1419;color:#e7ecf1;font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}}
+.box{{background:#1a222c;border:1px solid #2a3542;border-radius:14px;padding:28px 26px;max-width:420px;text-align:center}}
+p{{color:#8b9aab}}</style></head>
+<body><div class="box"><h1 style="font-size:17px;margin:0 0 8px">链接不可用</h1><p>{_html.escape(msg)}</p></div></body></html>"""
+
+
 MANAGE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1059,7 +1266,7 @@ __FAVICON__
   }
   .fscrumb a { color: var(--accent); text-decoration: none; cursor: pointer; }
   .fscrumb a:hover { text-decoration: underline; }
-  .fslist { max-height: 480px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+  .fslist { max-height: 480px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
   .fslist table { width: 100%; border-collapse: collapse; font-size: 13px; }
   .fslist th {
     position: sticky; top: 0; background: var(--panel);
@@ -1151,6 +1358,7 @@ __FAVICON__
     <a class="navitem" data-view="sessions" href="#sessions">会话</a>
     <a class="navitem" data-view="upload" href="#upload">上传</a>
     <a class="navitem" data-view="files" href="#files">下载</a>
+    <a class="navitem" data-view="shares" href="#shares">分享</a>
     <a class="navitem" data-view="llm" href="#llm">接入 AI</a>
     <a class="navitem" data-view="users" href="#users" id="navUsers" hidden>用户管理</a>
   </nav>
@@ -1229,6 +1437,21 @@ __FAVICON__
   </section>
   </div>
 
+  <div class="view" data-view="shares" hidden>
+    <h1 class="viewtitle">分享</h1>
+  <section class="card">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2 style="margin:0;font-size:16px">已分享的文件 <span class="sub" style="font-size:12px;font-weight:400">拿到链接的人无需登录即可下载</span></h2>
+      <div class="actions">
+        <button id="shRefresh" class="secondary" type="button">刷新</button>
+        <button id="shStopSel" class="danger" type="button">停止选中的分享</button>
+      </div>
+    </div>
+    <p class="sub" style="margin:8px 0">文件夹会打包为 zip 下载；停止分享后链接立即失效。删除文件或改路径也会让链接自动失效。</p>
+    <div id="shList" class="fslist"><p class="empty">加载中…</p></div>
+  </section>
+  </div>
+
   <div class="view" data-view="llm" hidden>
     <h1 class="viewtitle">接入你的 AI</h1>
   <section class="card">
@@ -1272,6 +1495,20 @@ __FAVICON__
     <div class="row">
       <button id="nameCancel" class="secondary" type="button">取消</button>
       <button id="nameConfirm" type="button">下一步</button>
+    </div>
+  </div>
+</div>
+
+<div id="shareModal" class="modal-mask" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="shareTitle">
+    <h3 id="shareTitle">分享链接</h3>
+    <p id="shareHint">任何拿到链接的人都可以<strong>免登录</strong>下载；链接由你随时停止。</p>
+    <input id="shareUrl" type="text" readonly autocomplete="off" spellcheck="false">
+    <p id="shareErr" class="modal-err" hidden></p>
+    <div class="row">
+      <button id="shareClose" class="secondary" type="button">关闭</button>
+      <button id="shareStop" class="danger" type="button" hidden>停止分享</button>
+      <button id="shareCopy" type="button">复制链接</button>
     </div>
   </div>
 </div>
@@ -2023,7 +2260,7 @@ document.getElementById('llmCopy').onclick = async () => {
 };
 
 // ---- 侧边栏视图切换 ----
-const VIEWS = ['sessions', 'upload', 'files', 'llm', 'users'];
+const VIEWS = ['sessions', 'upload', 'files', 'shares', 'llm', 'users'];
 let isAdmin = false;
 let usersLoaded = false;
 let currentView = '';
@@ -2044,6 +2281,7 @@ function showView(v, opts) {
     if (v === 'llm') loadLlmPrompt();
   }
   if (v === 'sessions') window.dispatchEvent(new Event('wt-view-sessions'));
+  if (v === 'shares') window.dispatchEvent(new Event('wt-view-shares'));
 }
 
 function initialView() {
@@ -2129,6 +2367,7 @@ refresh().catch(e => flash(String(e.message || e), true));
         '<span class="fmeta">' + esc(fmtSize(h.bytes)) + ' · ' + esc(h.ts || '') + '</span>' +
         '<button type="button" class="cp" data-path="' + esc(h.path) + '">复制路径</button>' +
         '<button type="button" class="op" data-act="download" title="下载到本机">下载</button>' +
+        '<button type="button" class="op" data-act="share" title="生成免登录下载链接">分享</button>' +
         '<button type="button" class="op" data-act="overwrite" title="选择本机文件重新上传，覆盖服务器上的同名文件">重新上传</button>' +
         '<button type="button" class="op del" data-act="delete" title="删除服务器上的这个文件">删除</button>' +
         '</li>';
@@ -2207,6 +2446,19 @@ refresh().catch(e => flash(String(e.message || e), true));
         flash('下载失败: ' + (e.message || e), true);
       }
       t.disabled = false; t.textContent = '下载';
+      return;
+    }
+    if (act === 'share') {
+      try {
+        const d = await api('/api/share', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: path }),
+        });
+        openShareModal(d.token, path);
+      } catch (e) {
+        flash('分享失败: ' + (e.message || e), true);
+      }
       return;
     }
     if (act === 'overwrite') {
@@ -2449,7 +2701,7 @@ refresh().catch(e => flash(String(e.message || e), true));
       for (const it of d.items) {
         const nameCls = it.dir ? 'dname' : 'dname file';
         const nav = it.dir ? ' data-nav="1"' : '';
-        html += '<tr data-rel="' + esc(it.rel) + '" data-dir="' + (it.dir ? 1 : 0) + '" data-kind="' + esc(it.kind || '') + '" data-previewable="' + (it.previewable ? 1 : 0) + '">' +
+        html += '<tr data-rel="' + esc(it.rel) + '" data-dir="' + (it.dir ? 1 : 0) + '" data-kind="' + esc(it.kind || '') + '" data-previewable="' + (it.previewable ? 1 : 0) + '" data-share="' + esc(it.share || '') + '">' +
           '<td><span class="' + nameCls + '"' + nav + '>' + (it.dir ? '📁 ' : (it.kind === 'image' ? '🖼 ' : '📄 ')) + esc(it.name) + '</span></td>' +
           '<td class="sz">' + (it.dir ? '-' : fmtSize(it.size)) + '</td>' +
           '<td class="sz">' + esc(it.mtime) + '</td>' +
@@ -2457,6 +2709,7 @@ refresh().catch(e => flash(String(e.message || e), true));
           (it.dir ? '<button class="op2" data-act="zip">下载</button>' :
             (it.previewable ? '<button class="op2" data-act="preview">预览</button>' : '') +
             '<button class="op2" data-act="download">下载</button>') +
+          '<button class="op2" data-act="share">' + (it.share ? '已分享' : '分享') + '</button>' +
           '</td></tr>';
       }
       if (d.truncated) {
@@ -2484,6 +2737,7 @@ refresh().catch(e => flash(String(e.message || e), true));
           const act = btn.getAttribute('data-act');
           if (act === 'download') doDownload(tr);
           else if (act === 'zip') doZip(tr, btn);
+          else if (act === 'share') doShare(tr);
           else doPreview(tr);
         });
       });
@@ -2643,6 +2897,185 @@ refresh().catch(e => flash(String(e.message || e), true));
   });
   window.addEventListener('wt-view-sessions', () => { idleIdx = 0; clearTimeout(timer); poll(); });
   poll();
+})();
+
+// ---- 文件分享 ----
+let shareModalToken = '';
+
+function shareUrlFor(token) {
+  return location.origin + '/s/' + token;
+}
+
+async function copyShareText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (e) {}
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch (e) { return false; }
+}
+
+function openShareModal(token, label) {
+  shareModalToken = token;
+  const mask = document.getElementById('shareModal');
+  const input = document.getElementById('shareUrl');
+  input.value = shareUrlFor(token);
+  document.getElementById('shareHint').textContent =
+    (label ? '「' + label + '」' : '') + '任何拿到链接的人都可以免登录下载；链接由你随时停止。';
+  document.getElementById('shareErr').hidden = true;
+  mask.hidden = false;
+  try { input.focus(); input.select(); } catch (e) {}
+}
+
+function closeShareModal() {
+  document.getElementById('shareModal').hidden = true;
+  shareModalToken = '';
+}
+
+document.getElementById('shareClose').onclick = closeShareModal;
+document.getElementById('shareCopy').onclick = async () => {
+  const btn = document.getElementById('shareCopy');
+  const ok = await copyShareText(document.getElementById('shareUrl').value);
+  btn.textContent = ok ? '已复制 ✓' : '复制失败';
+  setTimeout(() => { btn.textContent = '复制链接'; }, 1600);
+};
+document.getElementById('shareStop').onclick = async () => {
+  if (!shareModalToken) return;
+  if (!confirm('停止分享后，这个链接立即失效。确定吗？')) return;
+  const token = shareModalToken;
+  try {
+    await api('/api/share-revoke', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tokens: [token] }),
+    });
+    closeShareModal();
+    flash('已停止分享');
+    if (currentView === 'files') { const rf = document.getElementById('fsRefresh'); if (rf) rf.click(); }
+    if (currentView === 'shares') loadShares();
+  } catch (e) { flash('停止失败: ' + (e.message || e), true); }
+};
+
+async function doShare(tr) {
+  const rel = tr.getAttribute('data-rel') || '';
+  const token = tr.getAttribute('data-share') || '';
+  if (token) { openShareModal(token, rel); return; }
+  try {
+    const d = await api('/api/share', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rel: rel }),
+    });
+    tr.setAttribute('data-share', d.token);
+    const btn = tr.querySelector('button[data-act="share"]');
+    if (btn) btn.textContent = '已分享';
+    openShareModal(d.token, rel);
+  } catch (e) {
+    flash('分享失败: ' + (e.message || e), true);
+  }
+}
+
+// ---- 分享管理 ----
+let shareRows = [];
+let shareCanAll = false;
+
+async function loadShares() {
+  const listEl = document.getElementById('shList');
+  if (!listEl) return;
+  listEl.innerHTML = '<p class="empty">加载中…</p>';
+  try {
+    const d = await api('/api/shares');
+    shareRows = d.shares || [];
+    shareCanAll = !!d.can_all;
+    renderShares();
+  } catch (e) {
+    listEl.innerHTML = '<p class="empty">加载失败: ' + esc(String(e.message || e)) + '</p>';
+  }
+}
+
+function renderShares() {
+  const listEl = document.getElementById('shList');
+  if (!shareRows.length) {
+    listEl.innerHTML = '<p class="empty">还没有分享。到「下载」或「上传」里点文件/文件夹的「分享」即可生成链接。</p>';
+    return;
+  }
+  let html = '<table><thead><tr><th style="width:36px"><input type="checkbox" id="shAll" title="全选"></th>' +
+    '<th style="width:26%">名称</th><th>路径</th><th>类型</th>' + (shareCanAll ? '<th>创建者</th>' : '') +
+    '<th>创建时间</th><th>访问</th><th>操作</th></tr></thead><tbody>';
+  for (const s of shareRows) {
+    const url = shareUrlFor(s.token);
+    html += '<tr data-token="' + esc(s.token) + '">' +
+      '<td><input type="checkbox" class="shchk" value="' + esc(s.token) + '"></td>' +
+      '<td>' + esc(s.name || '') + (s.missing ? ' <span class="sub">（已失效）</span>' : '') + '</td>' +
+      '<td class="sz" title="' + esc(s.rel) + '">' + esc(s.rel) + '</td>' +
+      '<td class="sz">' + (s.kind === 'dir' ? '文件夹' : '文件') + '</td>' +
+      (shareCanAll ? '<td class="sz">' + esc(s.by) + '</td>' : '') +
+      '<td class="sz">' + esc(formatTime(s.created)) + '</td>' +
+      '<td class="sz">' + (Number(s.hits) || 0) + '</td>' +
+      '<td class="ops">' +
+        '<button class="op2" data-sact="copy" data-url="' + esc(url) + '">复制链接</button>' +
+        '<button class="op2" data-sact="open" data-url="' + esc(url) + '">打开</button>' +
+        '<button class="op2" data-sact="stop">停止</button>' +
+      '</td></tr>';
+  }
+  html += '</tbody></table>';
+  listEl.innerHTML = html;
+}
+
+(function initSharesView() {
+  const listEl = document.getElementById('shList');
+  if (!listEl) return;
+  listEl.addEventListener('click', async ev => {
+    const t = ev.target;
+    if (t && t.id === 'shAll') {
+      listEl.querySelectorAll('.shchk').forEach(c => { c.checked = t.checked; });
+      return;
+    }
+    const btn = t && t.closest ? t.closest('button[data-sact]') : null;
+    if (!btn) return;
+    const tr = btn.closest('tr');
+    const token = tr ? (tr.getAttribute('data-token') || '') : '';
+    const act = btn.getAttribute('data-sact');
+    if (act === 'copy') {
+      const ok = await copyShareText(btn.getAttribute('data-url') || '');
+      btn.textContent = ok ? '已复制 ✓' : '复制失败';
+      setTimeout(() => { btn.textContent = '复制链接'; }, 1600);
+    } else if (act === 'open') {
+      window.open(btn.getAttribute('data-url') || '', '_blank', 'noopener');
+    } else if (act === 'stop') {
+      if (!confirm('停止分享后，这个链接立即失效。确定吗？')) return;
+      try {
+        await api('/api/share-revoke', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tokens: [token] }),
+        });
+        shareRows = shareRows.filter(s => s.token !== token);
+        renderShares();
+        flash('已停止分享');
+      } catch (e) { flash('停止失败: ' + (e.message || e), true); }
+    }
+  });
+  const rf = document.getElementById('shRefresh');
+  if (rf) rf.onclick = loadShares;
+  const stopSel = document.getElementById('shStopSel');
+  if (stopSel) stopSel.onclick = async () => {
+    const sel = Array.from(listEl.querySelectorAll('.shchk:checked')).map(c => c.value);
+    if (!sel.length) { flash('请先勾选要停止的分享', true); return; }
+    if (!confirm('停止选中的 ' + sel.length + ' 个分享？链接将立即失效。')) return;
+    try {
+      const d = await api('/api/share-revoke', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tokens: sel }),
+      });
+      flash('已停止 ' + (d.removed || 0) + ' 个分享');
+      await loadShares();
+    } catch (e) { flash('停止失败: ' + (e.message || e), true); }
+  };
+  window.addEventListener('wt-view-shares', () => loadShares());
+  if (currentView === 'shares') loadShares();
 })();
 </script>
 </body>
@@ -3561,7 +3994,9 @@ class Handler(BaseHTTPRequestHandler):
     wt_user: str = USER
 
     def log_message(self, fmt: str, *args) -> None:
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        # 分享链接的 token 等同口令，别原样落日志
+        msg = re.sub(r"/s/[A-Za-z0-9_-]{16,64}", "/s/<token>", fmt % args)
+        sys.stderr.write("%s - %s\n" % (self.address_string(), msg))
 
     def _unauthorized(self) -> None:
         left, self._basic_locked = getattr(self, "_basic_locked", 0), 0   # 用后即清，避免 keep-alive 连接残留
@@ -3754,6 +4189,95 @@ class Handler(BaseHTTPRequestHandler):
             target = term_url(internal, ticket)
         self._redirect(target)
 
+    def _handle_share(self, path: str) -> None:
+        """公开分享（免登录）：/s/<token> 落地页，/s/<token>/download 下载。
+        只按 token 查记录、重新解析路径，不接受任何用户传入的路径。"""
+        parts = [p for p in path.split("/") if p]
+        bad = len(parts) < 2 or len(parts) > 3 or (len(parts) == 3 and parts[2] != "download")
+        if bad:
+            self._html(404, render_share_error("链接格式不正确"))
+            return
+        token = parts[1]
+        want_download = len(parts) == 3
+        sh = share_lookup(token)
+        if not sh:
+            self._html(404, render_share_error("分享链接不存在或已停止"))
+            return
+        try:
+            target = _fs_resolve(str(sh.get("rel") or ""))
+        except ValueError:
+            self._html(404, render_share_error("分享路径已失效"))
+            return
+        if not target.exists():
+            self._html(404, render_share_error("文件已不存在"))
+            return
+        if target.is_dir():
+            if not want_download:
+                self._html(200, render_share_page(target.name, token, "dir", 0))
+                return
+            if not _zip_slots.acquire(blocking=False):
+                self._html(429, render_share_error("当前打包任务较多，请稍后再试"))
+                return
+            try:
+                quoted = quote(target.name + ".zip")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition",
+                                 f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                share_hit(token)
+                try:
+                    n, sent = fs_stream_zip(target, self.wfile)
+                    sys.stderr.write(f"[share] zip {target} ({n} files, {sent} bytes)\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    sys.stderr.write(f"[share] zip {target} 客户端中断\n")
+                except OSError as e:
+                    sys.stderr.write(f"[share] zip {target} 失败: {e}\n")
+            finally:
+                _zip_slots.release()
+            return
+        if not target.is_file():
+            self._html(404, render_share_error("不是可下载的文件"))
+            return
+        try:
+            size = target.stat().st_size
+        except OSError:
+            self._html(404, render_share_error("文件不可读"))
+            return
+        if size > FS_DOWNLOAD_MAX:
+            self._html(400, render_share_error("文件超过 2GB，暂不支持下载"))
+            return
+        if not want_download:
+            self._html(200, render_share_page(target.name, token, "file", size))
+            return
+        quoted = quote(target.name)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition",
+                         f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
+        self.end_headers()
+        share_hit(token)
+        try:
+            with target.open("rb") as f:
+                while True:
+                    chunk = f.read(UPLOAD_BLOCK)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except OSError as e:
+            sys.stderr.write(f"[share] download {target} 失败: {e}\n")
+            return
+        sys.stderr.write(f"[share] download {target} ({size} bytes)\n")
+
     def _handle_enter(self, qs: dict[str, list[str]]) -> None:
         """/enter：终端页无票据时的入口。已登录 → 直接发票据跳回；未登录 → 登录页。"""
         next_url, name, create = self._enter_target(qs)
@@ -3807,7 +4331,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(404, {"error": "wt.py 不存在"})
             return
 
+        # 公开分享链接：/s/<token>（免登录下载），必须在鉴权之前
+        if path.startswith("/s/"):
+            self._handle_share(path)
+            return
+
         if not self._check_auth():
+            return
+
+        if path == "/api/shares":
+            self._json(200, {"shares": share_list(self.wt_user),
+                             "can_all": is_primary(self.wt_user)})
             return
 
         if path == "/api/users":
@@ -3956,7 +4490,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 # 支持三种输入：相对路径 / 绝对路径（根内）/ ~/ 开头；统一归一为根内相对路径
                 rel = _fs_rel_from_abs(raw)
-                self._json(200, fs_list(rel))
+                d = fs_list(rel)
+                shared = share_rel_map(self.wt_user)   # 标记已分享的条目前端显示「已分享」
+                for it in d.get("items", []):
+                    token = shared.get(it.get("rel") or "")
+                    if token:
+                        it["share"] = token
+                self._json(200, d)
             except FileNotFoundError as e:
                 self._json(404, {"error": str(e)})
             except (ValueError, PermissionError) as e:
@@ -4262,6 +4802,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"error": f"写入失败: {e}"})
                 return
             self._json(200, {"ok": True, "users": list_users_info()})
+            return
+
+        if path == "/api/share":
+            raw = str(data.get("rel") or data.get("path") or "").strip()
+            try:
+                info = share_create(raw, self.wt_user)
+            except FileNotFoundError as e:
+                self._json(404, {"error": str(e)})
+                return
+            except (ValueError, PermissionError) as e:
+                self._json(400, {"error": str(e)})
+                return
+            except OSError as e:
+                self._json(500, {"error": str(e)})
+                return
+            self._json(200, {"ok": True, **info})
+            return
+
+        if path == "/api/share-revoke":
+            tokens = data.get("tokens")
+            if isinstance(tokens, str):
+                tokens = [tokens]
+            if not isinstance(tokens, list):
+                tokens = [data.get("token")] if data.get("token") else []
+            removed = share_revoke([str(t) for t in tokens], self.wt_user)
+            self._json(200, {"ok": True, "removed": removed, "shares": share_list(self.wt_user)})
             return
 
         if path == "/api/upload-delete":
