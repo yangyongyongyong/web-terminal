@@ -140,9 +140,11 @@ class AutoUpdateTest(unittest.TestCase):
 
     def test_rollback_walks_back_until_healthy(self) -> None:
         """最近的候选不健康时，应继续往前回滚，直到找到健康版本。"""
-        for msg in ("v2", "v3", "v4"):
-            self.commit(msg)
-        # v1 健康，v2/v3/v4 都不健康 —— 回滚应一路走到 v1
+        v2 = self.commit("v2")
+        git(self.local, "pull", "-q", "--ff-only")     # 本地先到 v2
+        v3 = self.commit("v3")
+        v4 = self.commit("v4")
+        # 当前版本 v2 和 v3 都不健康，只有更早的 v1 健康 —— 应一路回退到 v1
         up = FakeUpdater(self.local, {self.v1}, {"AUTO_UPDATE_MAX_ROLLBACK": "4"})
         self.assertEqual(up.run(), 0)
         self.assertEqual(self.head(), self.v1, "应回滚到 v1")
@@ -150,6 +152,8 @@ class AutoUpdateTest(unittest.TestCase):
         self.assertEqual(st["last_action"], "rollback")
         self.assertEqual(st["last_good"], self.v1)
         self.assertFalse(st["paused"])
+        # 1 次更新尝试 + 3 次回滚尝试
+        self.assertEqual(up.restarts, 4)
 
     def test_all_rollbacks_fail_pauses(self) -> None:
         v2 = self.commit("v2")

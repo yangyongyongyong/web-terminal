@@ -257,6 +257,9 @@ class Updater:
         remote_ref = f"{self.remote}/{self.branch}"
         remote_sha = self.rev(remote_ref)
         head = self.rev("HEAD")
+        # 第一次运行时把当前版本记为「已知可用」，回滚优先回到它
+        if not st.get("last_good") and head:
+            st["last_good"] = head
         if not remote_sha:
             self.log(f"远端分支不存在: {remote_ref}")
             self.save_state(st)
@@ -324,6 +327,9 @@ class Updater:
                 if sha not in candidates and sha != bad_sha:
                     candidates.append(sha)
         candidates = candidates[: self.max_rollback]
+        # 之前已被判定坏掉的版本不再尝试，避免在坏版本之间来回跳
+        blocked = st.get("blocked") or {}
+        candidates = [c for c in candidates if c not in blocked]
         if not candidates:
             self.log("没有可回滚的历史版本")
             return False
