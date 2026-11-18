@@ -1,0 +1,17 @@
+[Unit]
+Description=Web Terminal 自动更新（git pull + 重启 + 异常回滚）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__ROOT__
+Environment=HOME=/root
+Environment=WT_AUTO_UPDATE=1
+ExecStart=__PYTHON__ __ROOT__/bin/auto-update.py
+# 拉取 + 重启 + 最多 5 次回滚，每次健康检查最多 AUTO_UPDATE_HEALTH_TIMEOUT 秒
+TimeoutStartSec=15min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

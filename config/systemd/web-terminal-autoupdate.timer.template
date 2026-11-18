@@ -1,0 +1,12 @@
+[Unit]
+Description=定期检查 GitHub 上 Web Terminal 的更新
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=__INTERVAL__min
+RandomizedDelaySec=60
+Persistent=true
+Unit=web-terminal-autoupdate.service
+
+[Install]
+WantedBy=timers.target
