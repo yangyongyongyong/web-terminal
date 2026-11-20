@@ -366,7 +366,8 @@ _UPLOAD_EXT_BLOCK = {
     ".app", ".dmg", ".pkg", ".command", ".scpt", ".workflow", ".applescript",
     ".sh", ".bash", ".zsh", ".fish", ".ksh",
     ".exe", ".msi", ".bat", ".cmd", ".ps1", ".scr", ".vbs", ".js", ".jse",
-    ".wsf", ".wsh", ".hta", ".jar", ".apk",
+    ".wsf", ".wsh", ".hta", ".jar",
+    # 注意：.apk 是 Android 安装包，在服务器上不会被执行，允许上传
 }
 _UPLOAD_MAX_PATH = 400  # 落盘相对路径长度上限（macOS APFS 文件名≤255）
 
