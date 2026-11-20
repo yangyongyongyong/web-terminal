@@ -1080,12 +1080,27 @@ PUBLIC_DIR = PUBLIC_DIR.resolve()
 PUBLIC_STATE_FILE = ROOT / "run" / "public-drive.json"
 PUBLIC_MAX_BYTES = int(ENV.get("PUBLIC_DRIVE_MAX_FILE_MB") or "2048") * 1024 * 1024
 PUBLIC_QUOTA_BYTES = int(ENV.get("PUBLIC_DRIVE_QUOTA_MB") or "4096") * 1024 * 1024
+# 每月上传+下载总流量上限（0=不限制）；页面里可随时调整，存 state 后以 state 为准
+PUBLIC_LIMIT_DEFAULT = int(ENV.get("PUBLIC_DRIVE_MONTHLY_LIMIT_MB") or "0") * 1024 * 1024
 PUBLIC_LOCK = threading.Lock()
 _PUBLIC_NAME_BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
+def _public_traffic_rollover(st: dict) -> bool:
+    """跨月清零。返回是否发生了重置。"""
+    month = time.strftime("%Y-%m")
+    if st.get("month") != month:
+        st["month"] = month
+        st["up_bytes"] = 0
+        st["down_bytes"] = 0
+        return True
+    return False
+
+
 def public_state_load() -> dict:
-    st = {"enabled": False, "token": "", "updated": "", "by": ""}
+    st = {"enabled": False, "token": "", "updated": "", "by": "",
+          "month": "", "up_bytes": 0, "down_bytes": 0,
+          "limit_bytes": PUBLIC_LIMIT_DEFAULT}
     try:
         obj = json.loads(PUBLIC_STATE_FILE.read_text(encoding="utf-8") or "{}")
     except (OSError, json.JSONDecodeError):
@@ -1096,6 +1111,12 @@ def public_state_load() -> dict:
         st["token"] = token if SHARE_TOKEN_RE.match(token) else ""
         st["updated"] = str(obj.get("updated") or "")
         st["by"] = str(obj.get("by") or "")
+        st["month"] = str(obj.get("month") or "")
+        for k in ("up_bytes", "down_bytes", "limit_bytes"):
+            try:
+                st[k] = max(0, int(obj.get(k, st[k])))
+            except (TypeError, ValueError):
+                pass
     return st
 
 
@@ -1171,6 +1192,59 @@ def public_usage() -> int:
     except OSError:
         pass
     return total
+
+
+def public_traffic() -> dict:
+    """当月公共文件夹总流量（上传 + 下载）。跨月自动清零。"""
+    with PUBLIC_LOCK:
+        st = public_state_load()
+        if _public_traffic_rollover(st):
+            try:
+                public_state_save(st)
+            except OSError:
+                pass
+        up = int(st.get("up_bytes") or 0)
+        down = int(st.get("down_bytes") or 0)
+        return {
+            "month": st.get("month") or time.strftime("%Y-%m"),
+            "up": up, "down": down, "total": up + down,
+            "limit": int(st.get("limit_bytes") or 0),
+        }
+
+
+def public_traffic_add(up: int = 0, down: int = 0) -> None:
+    up, down = max(0, int(up)), max(0, int(down))
+    if not up and not down:
+        return
+    with PUBLIC_LOCK:
+        st = public_state_load()
+        _public_traffic_rollover(st)
+        st["up_bytes"] = int(st.get("up_bytes") or 0) + up
+        st["down_bytes"] = int(st.get("down_bytes") or 0) + down
+        try:
+            public_state_save(st)
+        except OSError:
+            pass
+
+
+def public_set_limit(nbytes: int) -> int:
+    nbytes = int(nbytes)
+    if nbytes < 0:
+        raise ValueError("流量上限不能为负")
+    if nbytes > 1024 ** 4:
+        raise ValueError("流量上限过大（最大 1TB）")
+    with PUBLIC_LOCK:
+        st = public_state_load()
+        _public_traffic_rollover(st)
+        st["limit_bytes"] = nbytes
+        public_state_save(st)
+    return nbytes
+
+
+def public_traffic_limited() -> bool:
+    """0 表示不限制；达到上限后只暂停匿名公网访问，登录用户仍可管理。"""
+    t = public_traffic()
+    return t["limit"] > 0 and t["total"] >= t["limit"]
 
 
 def public_save_stream(name: str, length: int, rfile) -> tuple[Path, int]:
@@ -1425,6 +1499,11 @@ __FAVICON__
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
   input[type=text], input[type=password], input[type=search] {
     flex: 1; min-width: 160px;
+    background: #0c1117; color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; font: inherit;
+  }
+  select {
     background: #0c1117; color: var(--text);
     border: 1px solid var(--line); border-radius: 8px;
     padding: 10px 12px; font: inherit;
@@ -1786,6 +1865,18 @@ __FAVICON__
     </div>
     <div id="pubDrop" class="pubdrop">拖放文件到这里（手机可点上面的按钮选择）</div>
     <div id="pubUsage" class="sub" style="margin-top:8px"></div>
+    <div class="row" style="margin:14px 0 4px;align-items:center;flex-wrap:wrap">
+      <span id="pubTraffic" class="sub"></span>
+      <span style="flex:1 1 20px"></span>
+      <span class="sub">每月流量上限</span>
+      <input id="pubLimitVal" type="text" inputmode="decimal" autocomplete="off" style="flex:0 0 90px;min-width:90px;text-align:right">
+      <select id="pubLimitUnit" style="flex:0 0 78px">
+        <option value="1024">GB</option>
+        <option value="1">MB</option>
+      </select>
+      <button id="pubLimitSave" class="secondary" type="button">保存上限</button>
+    </div>
+    <div id="pubTrafficDetail" class="sub" style="margin:0 0 8px"></div>
   </section>
 
   <section class="card">
@@ -3424,7 +3515,23 @@ function renderShares() {
 })();
 
 // ---- 公共文件夹（临时公共网盘） ----
-let pubInfo = { enabled: false, url: '', files: [], used: 0, quota: 0, max_file: 0 };
+let pubInfo = { enabled: false, url: '', files: [], used: 0, quota: 0, max_file: 0,
+                traffic: { month: '', up: 0, down: 0, total: 0, limit: 0 } };
+
+function fmtTraffic(n) {
+  n = Number(n) || 0;
+  const kb = n / 1024;
+  if (kb < 1024) return (kb < 10 ? kb.toFixed(2) : kb.toFixed(1)) + ' KB';
+  const mb = kb / 1024;
+  if (mb < 1024) return (mb < 10 ? mb.toFixed(2) : mb.toFixed(1)) + ' MB';
+  return (mb / 1024).toFixed(2) + ' GB';
+}
+
+function fmtTrafficDetail(n) {
+  n = Number(n) || 0;
+  const kb = n / 1024, mb = kb / 1024, gb = mb / 1024;
+  return gb.toFixed(3) + ' GB / ' + mb.toFixed(2) + ' MB / ' + Math.round(kb).toLocaleString() + ' KB';
+}
 
 async function loadPublic() {
   const listEl = document.getElementById('pubList');
@@ -3454,6 +3561,27 @@ function renderPublic() {
     '已用 ' + fmtBytes(pubInfo.used) + ' / ' + fmtBytes(pubInfo.quota) +
     ' · 单文件上限 ' + fmtBytes(pubInfo.max_file) +
     ' · 共 ' + ((pubInfo.files || []).length) + ' 个文件';
+
+  // 当月流量与上限（仅登录用户可见）
+  const tr = pubInfo.traffic || { month: '', up: 0, down: 0, total: 0, limit: 0 };
+  const total = Number(tr.total) || 0;
+  const limit = Number(tr.limit) || 0;
+  const over = limit > 0 && total >= limit;
+  document.getElementById('pubTraffic').textContent =
+    '当月（' + (tr.month || '-') + '）累计流量：' + fmtTraffic(total) + (over ? ' · 已达上限' : '');
+  document.getElementById('pubTrafficDetail').textContent =
+    '上传 ' + fmtTraffic(tr.up) + ' · 下载 ' + fmtTraffic(tr.down) +
+    ' ｜ ' + fmtTrafficDetail(total) +
+    ' ｜ 上限 ' + (limit ? fmtTraffic(limit) : '不限制') +
+    (over ? '（公开链接已暂停上传/下载，登录用户不受影响）' : '');
+
+  const valEl = document.getElementById('pubLimitVal');
+  const unitEl = document.getElementById('pubLimitUnit');
+  if (document.activeElement !== valEl) {   // 正在输入时不要覆盖
+    if (limit === 0) { valEl.value = '0'; unitEl.value = '1024'; }
+    else if (limit >= 1024 * 1024 * 1024) { valEl.value = (limit / (1024 * 1024 * 1024)).toFixed(2); unitEl.value = '1024'; }
+    else { valEl.value = (limit / (1024 * 1024)).toFixed(1); unitEl.value = '1'; }
+  }
   const files = pubInfo.files || [];
   const listEl = document.getElementById('pubList');
   if (!files.length) { listEl.innerHTML = '<li class="empty">还没有文件</li>'; return; }
@@ -3537,6 +3665,24 @@ function renderPublic() {
     b.textContent = ok ? '已复制 ✓' : '复制失败';
     setTimeout(() => { b.textContent = '复制链接'; }, 1600);
   };
+  async function saveTrafficLimit() {
+    const v = parseFloat(document.getElementById('pubLimitVal').value);
+    if (!isFinite(v) || v < 0) { flash('请输入 >= 0 的数字（0 = 不限制）', true); return; }
+    const unit = Number(document.getElementById('pubLimitUnit').value) || 1024;  // 1024=GB, 1=MB
+    const bytes = Math.round(v * unit * 1024 * 1024);
+    try {
+      await api('/api/public/limit', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bytes: bytes }),
+      });
+      flash(bytes === 0 ? '已设为不限制' : '已保存每月流量上限');
+      await loadPublic();
+    } catch (e) { flash('保存失败: ' + (e.message || e), true); }
+  }
+  document.getElementById('pubLimitSave').onclick = saveTrafficLimit;
+  document.getElementById('pubLimitVal').addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') saveTrafficLimit();
+  });
   document.getElementById('pubList').addEventListener('click', async ev => {
     const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-act="del"]') : null;
     if (!btn) return;
@@ -4698,6 +4844,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Robots-Tag", "noindex, nofollow")
         self.end_headers()
+        sent = 0
         try:
             with p.open("rb") as f:
                 while True:
@@ -4705,8 +4852,11 @@ class Handler(BaseHTTPRequestHandler):
                     if not chunk:
                         break
                     self.wfile.write(chunk)
+                    sent += len(chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        finally:
+            public_traffic_add(down=sent)
 
     def _handle_public_get(self, path: str, qs: dict[str, list[str]]) -> None:
         """公开页 /p/<token>；下载 /p/<token>/download?name=。开关关闭后一律 404。"""
@@ -4718,6 +4868,9 @@ class Handler(BaseHTTPRequestHandler):
         token = parts[1]
         if not self._public_token_ok(token):
             self._html(404, render_share_error("公共文件夹已关闭或链接已失效"))
+            return
+        if public_traffic_limited():
+            self._html(429, render_share_error("本月共享流量已用完，暂时无法访问"))
             return
         if len(parts) == 3:
             self._serve_public_file(token, (qs.get("name") or [""])[0])
@@ -4753,6 +4906,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400 if isinstance(e, ValueError) else 500, {"error": str(e)})
             return
         sys.stderr.write(f"[public] upload {dest.name} ({written} bytes) from {self.client_address[0]}\n")
+        public_traffic_add(up=written)
         self._json(200, {"ok": True, "name": dest.name, "bytes": written})
 
     def _handle_public_post(self, path: str, qs: dict[str, list[str]]) -> None:
@@ -4764,6 +4918,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self._public_token_ok(parts[1]):
             self.close_connection = True
             self._json(404, {"error": "公共文件夹已关闭或链接已失效"})
+            return
+        if public_traffic_limited():
+            self.close_connection = True
+            self._json(429, {"error": "本月共享流量已用完，暂时无法上传"})
             return
         self._public_upload_response(qs)
 
@@ -4940,6 +5098,7 @@ class Handler(BaseHTTPRequestHandler):
                 "used": public_usage(),
                 "quota": PUBLIC_QUOTA_BYTES,
                 "max_file": PUBLIC_MAX_BYTES,
+                "traffic": public_traffic(),
             })
             return
 
@@ -5404,16 +5563,31 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/public/toggle":
             want = bool(data.get("enabled"))
-            st = public_state_load()
-            st["enabled"] = want
-            # 每次开启都换新 token：上一次的链接永久作废，适合「用完就关」
-            st["token"] = secrets.token_urlsafe(24) if want else ""
-            st["by"] = self.wt_user
-            st["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            public_state_save(st)
+            with PUBLIC_LOCK:
+                st = public_state_load()
+                st["enabled"] = want
+                # 每次开启都换新 token：上一次的链接永久作废，适合「用完就关」
+                st["token"] = secrets.token_urlsafe(24) if want else ""
+                st["by"] = self.wt_user
+                st["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                public_state_save(st)
             sys.stderr.write(f"[public] {self.wt_user} {'开启' if want else '关闭'}公网访问\n")
             self._json(200, {"ok": True, "enabled": st["enabled"],
                              "url": f"/p/{st['token']}" if st["enabled"] else ""})
+            return
+
+        if path == "/api/public/limit":
+            try:
+                nbytes = int(data.get("bytes") or 0)
+            except (TypeError, ValueError):
+                self._json(400, {"error": "无效的流量上限"})
+                return
+            try:
+                public_set_limit(nbytes)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            self._json(200, {"ok": True, "traffic": public_traffic()})
             return
 
         if path == "/api/public/delete":

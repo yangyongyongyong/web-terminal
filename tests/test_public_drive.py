@@ -6,6 +6,7 @@ import importlib.util
 import io
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -23,16 +24,19 @@ class PublicDriveTest(unittest.TestCase):
         self._state = ms.PUBLIC_STATE_FILE
         self._quota = ms.PUBLIC_QUOTA_BYTES
         self._max = ms.PUBLIC_MAX_BYTES
+        self._limit_default = ms.PUBLIC_LIMIT_DEFAULT
         ms.PUBLIC_DIR = self.tmp / "drive"
         ms.PUBLIC_STATE_FILE = self.tmp / "state.json"
         ms.PUBLIC_QUOTA_BYTES = 100
         ms.PUBLIC_MAX_BYTES = 60
+        ms.PUBLIC_LIMIT_DEFAULT = 0
 
     def tearDown(self) -> None:
         ms.PUBLIC_DIR = self._dir
         ms.PUBLIC_STATE_FILE = self._state
         ms.PUBLIC_QUOTA_BYTES = self._quota
         ms.PUBLIC_MAX_BYTES = self._max
+        ms.PUBLIC_LIMIT_DEFAULT = self._limit_default
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_name_validation(self) -> None:
@@ -81,6 +85,31 @@ class PublicDriveTest(unittest.TestCase):
         # 非法 token 不生效
         ms.public_state_save({"enabled": True, "token": "bad token!", "updated": "", "by": "u"})
         self.assertEqual(ms.public_open_token(), "")
+
+    def test_traffic_count_and_limit(self) -> None:
+        ms.public_traffic_add(up=100, down=50)
+        t = ms.public_traffic()
+        self.assertEqual((t["up"], t["down"], t["total"]), (100, 50, 150))
+        ms.public_set_limit(200)
+        self.assertFalse(ms.public_traffic_limited())
+        ms.public_traffic_add(down=100)
+        self.assertTrue(ms.public_traffic_limited(), "总流量达到上限后应暂停公网访问")
+        ms.public_set_limit(0)   # 0 = 不限制
+        self.assertFalse(ms.public_traffic_limited())
+
+    def test_traffic_month_rollover(self) -> None:
+        st = ms.public_state_load()
+        st.update({"month": "2000-01", "up_bytes": 10, "down_bytes": 20})
+        ms.public_state_save(st)
+        t = ms.public_traffic()
+        self.assertEqual(t["total"], 0, "跨月应清零")
+        self.assertEqual(t["month"], time.strftime("%Y-%m"))
+
+    def test_limit_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            ms.public_set_limit(-1)
+        with self.assertRaises(ValueError):
+            ms.public_set_limit(1024 ** 4 + 1)
 
 
 if __name__ == "__main__":
