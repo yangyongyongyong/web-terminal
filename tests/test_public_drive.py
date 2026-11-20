@@ -111,6 +111,15 @@ class PublicDriveTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ms.public_set_limit(1024 ** 4 + 1)
 
+    @unittest.skipUnless(ms.QRENCODE, "qrencode 未安装")
+    def test_qr_svg(self) -> None:
+        svg = ms.qr_svg("https://example.com/s/abc")
+        self.assertIn(b"<svg", svg)
+        with self.assertRaises(ValueError):
+            ms.qr_svg("")
+        with self.assertRaises(ValueError):
+            ms.qr_svg("x" * 2000)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

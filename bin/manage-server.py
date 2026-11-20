@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import stat as _stat
@@ -1247,6 +1248,29 @@ def public_traffic_limited() -> bool:
     return t["limit"] > 0 and t["total"] >= t["limit"]
 
 
+# ---- 二维码（分享链接 / 公共文件夹链接） ----
+QRENCODE = shutil.which("qrencode")
+
+
+def qr_svg(text: str) -> bytes:
+    """用 qrencode 生成 SVG 二维码。未安装时抛 RuntimeError，由上层降级。"""
+    if not QRENCODE:
+        raise RuntimeError("服务器未安装 qrencode（apt install qrencode / brew install qrencode）")
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("缺少二维码内容")
+    if len(text) > 1024:
+        raise ValueError("二维码内容过长")
+    cp = subprocess.run(
+        [QRENCODE, "-t", "SVG", "-l", "M", "-s", "6", "-m", "2", "-o", "-", text],
+        capture_output=True, timeout=5,
+    )
+    if cp.returncode != 0:
+        msg = (cp.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(msg or "二维码生成失败")
+    return cp.stdout
+
+
 def public_save_stream(name: str, length: int, rfile) -> tuple[Path, int]:
     """把请求体写入公共文件夹。先写隐藏临时文件，再原子改名；
     配额检查在落盘后按实际大小做，避免并发上传把磁盘写满。"""
@@ -1857,6 +1881,11 @@ __FAVICON__
       <button id="pubCopy" class="secondary" type="button">复制链接</button>
       <a id="pubOpen" class="btnlink" href="#" target="_blank" rel="noopener" style="align-self:center">打开</a>
     </div>
+    <div id="pubQrWrap" style="text-align:center;margin:4px 0 10px" hidden>
+      <img id="pubQr" alt="二维码" width="180" height="180"
+           style="background:#fff;border-radius:10px;padding:6px;width:180px;height:180px">
+      <div class="sub" style="font-size:12px">手机扫码即可打开公网链接</div>
+    </div>
     <p id="pubHint" class="sub" style="margin:8px 0"></p>
     <div class="row" style="margin:10px 0;align-items:center">
       <label class="btnfile" for="pubFileInput">选择文件上传</label>
@@ -1939,6 +1968,11 @@ __FAVICON__
     <h3 id="shareTitle">分享链接</h3>
     <p id="shareHint">任何拿到链接的人都可以<strong>免登录</strong>下载；链接由你随时停止。</p>
     <input id="shareUrl" type="text" readonly autocomplete="off" spellcheck="false">
+    <div id="shareQrWrap" style="text-align:center;margin:12px 0 2px">
+      <img id="shareQr" alt="二维码" width="180" height="180"
+           style="background:#fff;border-radius:10px;padding:6px;width:180px;height:180px">
+      <div class="sub" style="font-size:12px">手机扫码打开</div>
+    </div>
     <p id="shareErr" class="modal-err" hidden></p>
     <div class="row">
       <button id="shareClose" class="secondary" type="button">关闭</button>
@@ -3361,6 +3395,11 @@ function openShareModal(token, label) {
   const mask = document.getElementById('shareModal');
   const input = document.getElementById('shareUrl');
   input.value = shareUrlFor(token);
+  const qr = document.getElementById('shareQr');
+  const qrWrap = document.getElementById('shareQrWrap');
+  qrWrap.hidden = false;
+  qr.onerror = () => { qrWrap.hidden = true; };   // 服务器没装 qrencode 时隐藏
+  qr.src = '/api/qr?text=' + encodeURIComponent(shareUrlFor(token));
   document.getElementById('shareHint').textContent =
     (label ? '「' + label + '」' : '') + '任何拿到链接的人都可以免登录下载；链接由你随时停止。';
   document.getElementById('shareErr').hidden = true;
@@ -3553,6 +3592,13 @@ function renderPublic() {
   if (on) {
     document.getElementById('pubUrl').value = location.origin + pubInfo.url;
     document.getElementById('pubOpen').href = pubInfo.url;
+  }
+  const qrWrap = document.getElementById('pubQrWrap');
+  qrWrap.hidden = !on;
+  if (on) {
+    const qr = document.getElementById('pubQr');
+    qr.onerror = () => { qrWrap.hidden = true; };
+    qr.src = '/api/qr?text=' + encodeURIComponent(location.origin + pubInfo.url);
   }
   document.getElementById('pubHint').textContent = on
     ? '任何人拿到这个链接都能上传和下载（无需登录）。用完请点「关闭公网访问」，链接立即失效。'
@@ -5083,6 +5129,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/shares":
             self._json(200, {"shares": share_list(self.wt_user),
                              "can_all": is_primary(self.wt_user)})
+            return
+
+        if path == "/api/qr":   # 分享链接 / 公共文件夹链接的二维码（仅登录用户）
+            text = (qs.get("text") or [""])[0]
+            try:
+                svg = qr_svg(text)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            except RuntimeError as e:
+                self._json(503, {"error": str(e)})
+                return
+            self._send(200, svg, "image/svg+xml; charset=utf-8",
+                       [("Cache-Control", "no-store")])
             return
 
         if path == "/api/public":
