@@ -1879,12 +1879,8 @@ __FAVICON__
     <div id="pubUrlRow" class="row" hidden style="margin:10px 0">
       <input id="pubUrl" type="text" readonly autocomplete="off" spellcheck="false">
       <button id="pubCopy" class="secondary" type="button">复制链接</button>
+      <button id="pubQrBtn" class="secondary" type="button">二维码</button>
       <a id="pubOpen" class="btnlink" href="#" target="_blank" rel="noopener" style="align-self:center">打开</a>
-    </div>
-    <div id="pubQrWrap" style="text-align:center;margin:4px 0 10px" hidden>
-      <img id="pubQr" alt="二维码" width="180" height="180"
-           style="background:#fff;border-radius:10px;padding:6px;width:180px;height:180px">
-      <div class="sub" style="font-size:12px">手机扫码即可打开公网链接</div>
     </div>
     <p id="pubHint" class="sub" style="margin:8px 0"></p>
     <div class="row" style="margin:10px 0;align-items:center">
@@ -1968,16 +1964,28 @@ __FAVICON__
     <h3 id="shareTitle">分享链接</h3>
     <p id="shareHint">任何拿到链接的人都可以<strong>免登录</strong>下载；链接由你随时停止。</p>
     <input id="shareUrl" type="text" readonly autocomplete="off" spellcheck="false">
-    <div id="shareQrWrap" style="text-align:center;margin:12px 0 2px">
-      <img id="shareQr" alt="二维码" width="180" height="180"
-           style="background:#fff;border-radius:10px;padding:6px;width:180px;height:180px">
-      <div class="sub" style="font-size:12px">手机扫码打开</div>
-    </div>
     <p id="shareErr" class="modal-err" hidden></p>
     <div class="row">
       <button id="shareClose" class="secondary" type="button">关闭</button>
       <button id="shareStop" class="danger" type="button" hidden>停止分享</button>
+      <button id="shareQrBtn" class="secondary" type="button">二维码</button>
       <button id="shareCopy" type="button">复制链接</button>
+    </div>
+  </div>
+</div>
+
+<div id="qrModal" class="modal-mask" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="qrTitle">
+    <h3 id="qrTitle">二维码</h3>
+    <p id="qrHint" class="sub">手机扫码打开</p>
+    <div style="text-align:center;margin:12px 0 4px">
+      <img id="qrImg" alt="二维码" width="220" height="220"
+           style="background:#fff;border-radius:12px;padding:8px;width:220px;height:220px">
+    </div>
+    <p id="qrErr" class="modal-err" hidden></p>
+    <div class="row">
+      <button id="qrClose" class="secondary" type="button">关闭</button>
+      <button id="qrCopy" type="button">复制链接</button>
     </div>
   </div>
 </div>
@@ -3371,9 +3379,12 @@ refresh().catch(e => flash(String(e.message || e), true));
 
 // ---- 文件分享 ----
 let shareModalToken = '';
+let shareModalName = '';
 
-function shareUrlFor(token) {
-  return location.origin + '/s/' + token;
+function shareUrlFor(token, name) {
+  let url = location.origin + '/s/' + token;
+  if (name) url += '/' + encodeURIComponent(name);   // 文件名为可读 slug，服务端忽略
+  return url;
 }
 
 async function copyShareText(text) {
@@ -3392,14 +3403,10 @@ async function copyShareText(text) {
 
 function openShareModal(token, label) {
   shareModalToken = token;
+  shareModalName = String(label || '').split('/').pop();
   const mask = document.getElementById('shareModal');
   const input = document.getElementById('shareUrl');
-  input.value = shareUrlFor(token);
-  const qr = document.getElementById('shareQr');
-  const qrWrap = document.getElementById('shareQrWrap');
-  qrWrap.hidden = false;
-  qr.onerror = () => { qrWrap.hidden = true; };   // 服务器没装 qrencode 时隐藏
-  qr.src = '/api/qr?text=' + encodeURIComponent(shareUrlFor(token));
+  input.value = shareUrlFor(token, shareModalName);
   document.getElementById('shareHint').textContent =
     (label ? '「' + label + '」' : '') + '任何拿到链接的人都可以免登录下载；链接由你随时停止。';
   document.getElementById('shareErr').hidden = true;
@@ -3410,7 +3417,37 @@ function openShareModal(token, label) {
 function closeShareModal() {
   document.getElementById('shareModal').hidden = true;
   shareModalToken = '';
+  shareModalName = '';
 }
+
+let qrModalUrl = '';
+
+function openQrModal(url, title) {
+  qrModalUrl = url;
+  document.getElementById('qrTitle').textContent = title || '二维码';
+  const img = document.getElementById('qrImg');
+  const err = document.getElementById('qrErr');
+  err.hidden = true;
+  img.hidden = false;
+  img.onerror = () => {
+    img.hidden = true;
+    err.textContent = '二维码生成失败（服务器可能未安装 qrencode）';
+    err.hidden = false;
+  };
+  img.src = '/api/qr?text=' + encodeURIComponent(url);
+  document.getElementById('qrModal').hidden = false;
+}
+
+document.getElementById('qrClose').onclick = () => { document.getElementById('qrModal').hidden = true; };
+document.getElementById('qrCopy').onclick = async () => {
+  const b = document.getElementById('qrCopy');
+  const ok = await copyShareText(qrModalUrl);
+  b.textContent = ok ? '已复制 ✓' : '复制失败';
+  setTimeout(() => { b.textContent = '复制链接'; }, 1600);
+};
+document.getElementById('qrModal').addEventListener('click', ev => {
+  if (ev.target === document.getElementById('qrModal')) document.getElementById('qrModal').hidden = true;
+});
 
 document.getElementById('shareClose').onclick = closeShareModal;
 document.getElementById('shareCopy').onclick = async () => {
@@ -3418,6 +3455,10 @@ document.getElementById('shareCopy').onclick = async () => {
   const ok = await copyShareText(document.getElementById('shareUrl').value);
   btn.textContent = ok ? '已复制 ✓' : '复制失败';
   setTimeout(() => { btn.textContent = '复制链接'; }, 1600);
+};
+document.getElementById('shareQrBtn').onclick = () => {
+  if (!shareModalToken) return;
+  openQrModal(shareUrlFor(shareModalToken, shareModalName), '分享二维码');
 };
 document.getElementById('shareStop').onclick = async () => {
   if (!shareModalToken) return;
@@ -3481,7 +3522,7 @@ function renderShares() {
     '<th style="width:26%">名称</th><th>路径</th><th>类型</th>' + (shareCanAll ? '<th>创建者</th>' : '') +
     '<th>创建时间</th><th>访问</th><th>操作</th></tr></thead><tbody>';
   for (const s of shareRows) {
-    const url = shareUrlFor(s.token);
+    const url = shareUrlFor(s.token, s.name);
     html += '<tr data-token="' + esc(s.token) + '">' +
       '<td><input type="checkbox" class="shchk" value="' + esc(s.token) + '"></td>' +
       '<td>' + esc(s.name || '') + (s.missing ? ' <span class="sub">（已失效）</span>' : '') + '</td>' +
@@ -3493,6 +3534,7 @@ function renderShares() {
       '<td class="ops">' +
         '<button class="op2" data-sact="copy" data-url="' + esc(url) + '">复制链接</button>' +
         '<button class="op2" data-sact="open" data-url="' + esc(url) + '">打开</button>' +
+        '<button class="op2" data-sact="qr" data-url="' + esc(url) + '">二维码</button>' +
         '<button class="op2" data-sact="stop">停止</button>' +
       '</td></tr>';
   }
@@ -3520,6 +3562,8 @@ function renderShares() {
       setTimeout(() => { btn.textContent = '复制链接'; }, 1600);
     } else if (act === 'open') {
       window.open(btn.getAttribute('data-url') || '', '_blank', 'noopener');
+    } else if (act === 'qr') {
+      openQrModal(btn.getAttribute('data-url') || '', '分享二维码');
     } else if (act === 'stop') {
       if (!confirm('停止分享后，这个链接立即失效。确定吗？')) return;
       try {
@@ -3592,13 +3636,6 @@ function renderPublic() {
   if (on) {
     document.getElementById('pubUrl').value = location.origin + pubInfo.url;
     document.getElementById('pubOpen').href = pubInfo.url;
-  }
-  const qrWrap = document.getElementById('pubQrWrap');
-  qrWrap.hidden = !on;
-  if (on) {
-    const qr = document.getElementById('pubQr');
-    qr.onerror = () => { qrWrap.hidden = true; };
-    qr.src = '/api/qr?text=' + encodeURIComponent(location.origin + pubInfo.url);
   }
   document.getElementById('pubHint').textContent = on
     ? '任何人拿到这个链接都能上传和下载（无需登录）。用完请点「关闭公网访问」，链接立即失效。'
@@ -3710,6 +3747,10 @@ function renderPublic() {
     const ok = await copyShareText(document.getElementById('pubUrl').value);
     b.textContent = ok ? '已复制 ✓' : '复制失败';
     setTimeout(() => { b.textContent = '复制链接'; }, 1600);
+  };
+  document.getElementById('pubQrBtn').onclick = () => {
+    if (!pubInfo.enabled) return;
+    openQrModal(location.origin + pubInfo.url, '公共文件夹二维码');
   };
   async function saveTrafficLimit() {
     const v = parseFloat(document.getElementById('pubLimitVal').value);
@@ -4972,15 +5013,15 @@ class Handler(BaseHTTPRequestHandler):
         self._public_upload_response(qs)
 
     def _handle_share(self, path: str) -> None:
-        """公开分享（免登录）：/s/<token> 落地页，/s/<token>/download 下载。
+        """公开分享（免登录）：/s/<token>[/<文件名>] 落地页，/s/<token>/download 下载。
+        第三段只作为可读的文件名（slug），不参与查找；旧链接 /s/<token> 继续可用。
         只按 token 查记录、重新解析路径，不接受任何用户传入的路径。"""
         parts = [p for p in path.split("/") if p]
-        bad = len(parts) < 2 or len(parts) > 3 or (len(parts) == 3 and parts[2] != "download")
-        if bad:
+        if len(parts) < 2 or len(parts) > 3:
             self._html(404, render_share_error("链接格式不正确"))
             return
         token = parts[1]
-        want_download = len(parts) == 3
+        want_download = len(parts) == 3 and parts[2] == "download"
         sh = share_lookup(token)
         if not sh:
             self._html(404, render_share_error("分享链接不存在或已停止"))
