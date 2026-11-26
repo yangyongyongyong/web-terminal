@@ -545,9 +545,15 @@ def new_upload_batch_dir(user: str = "") -> Path:
 
 def record_upload(dest: Path, size: int, user: str = "") -> None:
     """追加一条上传记录到该用户的历史，只保留最近 KEEP 条。失败不影响上传结果。"""
+    # rel 必须相对上传根（含批次子目录）：历史里的「下载」按钮用它定位文件，
+    # 只存文件名会让批次目录里的文件下载时 404。
+    try:
+        rel_out = str(dest.relative_to(upload_dir_for(user)))
+    except ValueError:
+        rel_out = dest.name
     item = {
         "path": str(dest),
-        "rel": dest.name,
+        "rel": rel_out,
         "bytes": size,
         "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }
@@ -593,6 +599,38 @@ def _resolve_upload_rel(rel: str, user: str = "") -> Path:
     real_dest = dest.resolve(strict=False)
     if real_dest != real_dl and real_dl not in real_dest.parents:
         raise ValueError("非法的目标路径")
+    return dest
+
+
+def resolve_upload_download(rel: str, raw_path: str, user: str = "") -> Path:
+    """定位历史记录里的文件。
+
+    优先用记录里的绝对路径（必须在用户上传根内）；否则走 rel。
+    旧记录的 rel 只有文件名，文件实际在批次子目录里，按文件名在用户上传根
+    内找唯一匹配，避免历史里的「下载」按钮 404。
+    """
+    base = upload_dir_for(user)
+    real_base = base.resolve()
+    if raw_path:
+        try:
+            candidate = Path(raw_path).resolve(strict=False)
+            if candidate == real_base or real_base in candidate.parents:
+                return candidate
+        except OSError:
+            pass
+    dest = _resolve_upload_rel(rel, user)
+    if dest.is_file():
+        return dest
+    if rel and "/" not in rel and "\\" not in rel and not rel.startswith("."):
+        try:
+            matches = [
+                p for p in base.rglob(rel)
+                if p.is_file() and (p.resolve() == real_base or real_base in p.resolve().parents)
+            ]
+        except OSError:
+            matches = []
+        if len(matches) == 1:
+            return matches[0]
     return dest
 
 
@@ -2905,7 +2943,7 @@ refresh().catch(e => flash(String(e.message || e), true));
       // 同源 fetch 带 Basic Auth（浏览器已缓存凭据），blob 触发保存
       t.disabled = true; t.textContent = '…';
       try {
-        const res = await fetch('/api/upload-download?rel=' + encodeURIComponent(rel), { credentials: 'same-origin' });
+        const res = await fetch('/api/upload-download?rel=' + encodeURIComponent(rel) + '&path=' + encodeURIComponent(path), { credentials: 'same-origin' });
         if (!res.ok) {
           let msg = 'HTTP ' + res.status;
           try { msg = (await res.json()).error || msg; } catch (e) {}
@@ -4710,6 +4748,14 @@ class Handler(BaseHTTPRequestHandler):
         msg = re.sub(r"/([sp])/[A-Za-z0-9_-]{16,64}", r"/\1/<token>", fmt % args)
         sys.stderr.write("%s - %s\n" % (self.address_string(), msg))
 
+    def handle_error(self, request, client_address) -> None:
+        # 手机浏览器在 keep-alive 连接上提前关闭时会走到这里；
+        # 不是服务故障，别把整段 traceback 刷进日志。
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
     def _unauthorized(self) -> None:
         left, self._basic_locked = getattr(self, "_basic_locked", 0), 0   # 用后即清，避免 keep-alive 连接残留
         if left:
@@ -5315,8 +5361,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/upload-download":
             qs = parse_qs(parsed.query)
             rel = unquote((qs.get("rel") or [""])[0]).strip()
+            raw_path = unquote((qs.get("path") or [""])[0]).strip()
             try:
-                dest = _resolve_upload_rel(rel, self.wt_user)
+                dest = resolve_upload_download(rel, raw_path, self.wt_user)
             except ValueError as e:
                 self._json(400, {"error": str(e)})
                 return
@@ -5536,6 +5583,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(e)})
             return
         except RuntimeError as e:
+            # 写盘/读请求体失败时留下原因，否则日志里只看到一条 500
+            sys.stderr.write(f"[upload] 上传失败 {rel}: {e}\n")
             self._json(500, {"error": str(e)})
             return
         rel_out = str(dest.relative_to(UPLOAD_DIR))
